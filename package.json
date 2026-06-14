@@ -1,0 +1,185 @@
+{
+  "name": "opencode-web-sidebar",
+  "displayName": "OpenCode Sidebar GUI (web)",
+  "description": "Renders OpenCode's web UI in a sidebar panel - connects to your web server or starts a new one",
+  "version": "0.4.0",
+  "license": "MIT",
+  "publisher": "bmpenuelas",
+  "homepage": "https://github.com/bmpenuelas/opencode-web-sidebar",
+  "bugs": {
+    "email": "bmpenuelas@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bmpenuelas/opencode-web-sidebar.git"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other",
+    "Chat"
+  ],
+  "icon": "media/icon.png",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:opencode-web-sidebar.openPanel",
+    "onCommand:opencode-web-sidebar.setPassword",
+    "onCommand:opencode-web-sidebar.clearPassword",
+    "onCommand:opencode-web-sidebar.startServer",
+    "onCommand:opencode-web-sidebar.stopServer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "opencode-web-sidebar",
+          "title": "OpenCode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencode-web-sidebar": [
+        {
+          "type": "webview",
+          "id": "opencode-web-sidebar.view",
+          "name": "OpenCode"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencode-web-sidebar.openPanel",
+        "title": "Toggle Panel",
+        "category": "OpenCode",
+        "icon": {
+          "light": "media/icon.svg",
+          "dark": "media/icon.svg"
+        }
+      },
+      {
+        "command": "opencode-web-sidebar.closePanel",
+        "title": "Close Panel",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.focusPanel",
+        "title": "Focus Panel",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.openFile",
+        "title": "Open File",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.setPassword",
+        "title": "Set Server Password",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.clearPassword",
+        "title": "Clear Server Password",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.startServer",
+        "title": "Start OpenCode Web Server",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.stopServer",
+        "title": "Stop OpenCode Web Server",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode-web-sidebar.openSettings",
+        "title": "Settings",
+        "category": "OpenCode",
+        "icon": "$(gear)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "opencode-web-sidebar.openPanel",
+          "group": "navigation",
+          "when": "!config.opencode-web-sidebar.hideButton"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "opencode-web-sidebar.openSettings",
+          "when": "view == opencode-web-sidebar.view",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "opencode-web-sidebar.stopServer",
+          "when": "opencode-web-sidebar.startedByUs"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "opencode-web-sidebar.openPanel",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode Sidebar",
+      "properties": {
+        "opencode-web-sidebar.url": {
+          "type": "string",
+          "default": "http://localhost:4096",
+          "description": "URL of the OpenCode web UI to embed in the sidebar panel"
+        },
+        "opencode-web-sidebar.hideButton": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hide the OpenCode button from the editor title bar"
+        },
+        "opencode-web-sidebar.autoReconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically attempt to reconnect when the server is unreachable"
+        },
+        "opencode-web-sidebar.maxReconnectAttempts": {
+          "type": "number",
+          "default": 0,
+          "description": "Maximum number of reconnection attempts (0 = unlimited)"
+        },
+        "opencode-web-sidebar.serverCommand": {
+          "type": "string",
+          "default": "opencode web --port 4096",
+          "description": "Command to start the OpenCode web server. Split into executable and arguments by whitespace."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src",
+    "pretest": "npm run compile && npm run lint",
+    "test": "vscode-test",
+    "publish:marketplace": "vsce package && vsce publish",
+    "publish:openvsx": "bash -c \"read -p 'Enter packaged filename: ' filename && read -sp 'Enter openvsx token: ' token && echo && npx ovsx publish \\\"$filename\\\" -p \\\"$token\\\"\"",
+    "publish": "npm version minor --no-git-tag-version && npm run publish:marketplace && npm run publish:openvsx"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "@types/vscode": "^1.106.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.1",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1"
+  }
+}
