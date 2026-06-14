@@ -13,22 +13,26 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('opencode-web-sidebar.openPanel', async () => {
       if (panel!.isVisible) {
-        panel!.close();
+        await panel!.close();
+        await context.globalState.update('opencode-web-sidebar.panelOpen', false);
         return;
       }
       await panel!.show();
+      await context.globalState.update('opencode-web-sidebar.panelOpen', true);
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('opencode-web-sidebar.focusPanel', async () => {
       await panel!.show();
+      await context.globalState.update('opencode-web-sidebar.panelOpen', true);
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('opencode-web-sidebar.closePanel', () => {
-      panel!.close();
+    vscode.commands.registerCommand('opencode-web-sidebar.closePanel', async () => {
+      await panel!.close();
+      await context.globalState.update('opencode-web-sidebar.panelOpen', false);
     })
   );
 
@@ -93,9 +97,29 @@ export function activate(context: vscode.ExtensionContext) {
     }
   });
 
-  setTimeout(() => {
-    vscode.commands.executeCommand('workbench.view.extension.opencode-web-sidebar');
-  }, 500);
+  const hasFolder = !!(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
+  const panelWasOpen = context.globalState.get<boolean>('opencode-web-sidebar.panelOpen', true);
+
+  if (hasFolder && panelWasOpen) {
+    setTimeout(() => {
+      vscode.commands.executeCommand('workbench.view.extension.opencode-web-sidebar');
+    }, 500);
+  } else if (!hasFolder) {
+    setTimeout(() => {
+      if (panel?.isVisible) {
+        panel.close();
+      }
+    }, 500);
+  }
+
+  vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    const hasFolderNow = !!(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
+    if (hasFolderNow && context.globalState.get<boolean>('opencode-web-sidebar.panelOpen', true)) {
+      panel?.show();
+    } else if (!hasFolderNow && panel?.isVisible) {
+      panel?.close();
+    }
+  });
 }
 
 export function deactivate() {

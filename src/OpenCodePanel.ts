@@ -6,14 +6,14 @@ function escapeAttr(text: string): string {
   return text.replace(/"/g, '&quot;');
 }
 
-type ConnectionState = 'disconnected' | 'auth-required' | 'connected' | 'starting';
+type ConnectionState = 'checking' | 'disconnected' | 'auth-required' | 'connected' | 'starting';
 
 export class OpenCodePanel implements vscode.WebviewViewProvider {
   public static readonly viewType = 'opencode-web-sidebar.view';
 
   private _view: vscode.WebviewView | undefined;
   private _isVisible = false;
-  private _connectionState: ConnectionState = 'disconnected';
+  private _connectionState: ConnectionState = 'checking';
   private _statusBarItem: vscode.StatusBarItem;
   private _pollTimer: ReturnType<typeof setInterval> | undefined;
   private _reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -368,7 +368,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   }
 
   private updateStatusBar(): void {
-    if (this._connectionState === 'starting') {
+    if (this._connectionState === 'checking') {
+      this._statusBarItem.text = '$(globe) OpenCode: Checking...';
+      this._statusBarItem.backgroundColor = undefined;
+      this._statusBarItem.tooltip = 'Checking OpenCode server...';
+      this._statusBarItem.show();
+    } else if (this._connectionState === 'starting') {
       this._statusBarItem.text = '$(globe) OpenCode: Starting...';
       this._statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       this._statusBarItem.tooltip = 'Starting OpenCode server...';
@@ -390,7 +395,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._statusBarItem.show();
     } else {
       this._statusBarItem.text = '$(globe) OpenCode: Disconnected';
-      this._statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      this._statusBarItem.backgroundColor = undefined;
       this._statusBarItem.tooltip = 'OpenCode server is not reachable — click to open panel';
       this._statusBarItem.show();
     }
@@ -474,6 +479,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this.render();
     } else if (this._connectionState === 'starting') {
       this.log('Waiting for server to start...');
+    } else if (this._connectionState === 'checking') {
+      this._connectionState = 'disconnected';
+      this.updateStatusBar();
+      this.render();
     } else {
       this._isReconnecting = true;
       this._connectionState = 'disconnected';
@@ -539,7 +548,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     let statusColor: string;
     let statusText: string;
-    if (this._connectionState === 'starting') {
+    if (this._connectionState === 'checking') {
+      statusColor = '#e5c07b';
+      statusText = 'Checking...';
+    } else if (this._connectionState === 'starting') {
       statusColor = '#e5c07b';
       statusText = 'Starting...';
     } else if (this._isReconnecting) {
@@ -569,6 +581,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         '<span>Connection lost, reconnecting...</span>' +
         '<div class="btn-row"><button onclick="cancelReconnect()">Cancel</button>' +
         '<button onclick="openSettings()">Settings</button></div>';
+    } else if (this._connectionState === 'checking') {
+      overlayContent =
+        '<div class="oc-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="40" height="40" fill="none"><path fill="#f1ecec" d="M180 60H60v180h120zm60 240H0V0h240z" clip-path="url(#b)" mask="url(#a)" transform="translate(30)"/><defs><clipPath id="b" clipPathUnits="userSpaceOnUse"><path fill="#fff" d="M0 0h240v300H0z"/></clipPath><mask id="a" maskUnits="userSpaceOnUse"><path fill="#fff" d="M240 0H0v300h240z"/></mask></defs></svg></div>' +
+        '<div class="spinner"></div>' +
+        '<span>Connecting to server...</span>';
     } else if (this._connectionState === 'starting') {
       overlayContent =
         '<div class="spinner"></div>' +
@@ -665,6 +682,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       background:var(--vscode-button-background,#007acc);
       color:var(--vscode-button-foreground,#fff);
       font-family:var(--vscode-font-family,sans-serif);
+    }
+    .overlay .oc-icon {
+      display:flex; align-items:center; justify-content:center; opacity:.5;
+      margin-bottom:8px;
     }
     .overlay .spinner {
       width:24px; height:24px; border:3px solid var(--vscode-descriptionForeground,#999);
