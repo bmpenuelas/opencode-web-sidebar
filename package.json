@@ -157,6 +157,15 @@
           "type": "string",
           "default": "opencode web --port 4096",
           "description": "Command to start the OpenCode web server. Split into executable and arguments by whitespace."
+        },
+        "opencode-web-sidebar.workspacePathStyle": {
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "none",
+            "wsl"
+          ],
+          "description": "Path translation mode for the X-Workspace-Folder header: 'none' (pass raw path), 'wsl' (convert C:\\... to /mnt/c/... for WSL servers)"
         }
       }
     }

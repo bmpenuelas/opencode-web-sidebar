@@ -38,6 +38,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this.loadCachedCredentials();
     this.updateStatusBar();
     vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
+    vscode.workspace.onDidChangeWorkspaceFolders(() => this.onWorkspaceFoldersChanged());
   }
 
   private log(msg: string): void {
@@ -196,6 +197,22 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
   }
 
+  private getWorkspaceFolder(): string {
+    const raw = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    this.log(`Workspace folder raw: ${raw || '(none)'}`);
+    if (!raw) {return '';}
+    const style = vscode.workspace.getConfiguration('opencode-web-sidebar')
+      .get<'none' | 'wsl'>('workspacePathStyle', 'none');
+    if (style === 'wsl' && process.platform === 'win32') {
+      const translated = raw.replace(/^([A-Za-z]):\\/, (_, l: string) => `/mnt/${l.toLowerCase()}/`)
+                .replace(/\\/g, '/');
+      this.log(`Workspace folder translated (wsl): ${translated}`);
+      return translated;
+    }
+    this.log(`Workspace folder: ${raw}`);
+    return raw;
+  }
+
   private async startProxy(): Promise<void> {
     await this.stopProxy();
     const url = this.getConfiguredUrl();
@@ -210,12 +227,17 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         parsed.password = this._cachedPassword;
       }
       const targetUrl = parsed.toString();
-      this.log(`Starting proxy for ${parsed.host}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
-      this._proxy = await startProxy(targetUrl);
+      const wsFolder = this.getWorkspaceFolder();
+      this.log(`Starting proxy for ${parsed.host} workspace=${wsFolder || '(none)'}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
+      this._proxy = await startProxy(targetUrl, wsFolder);
       this.log(`Proxy listening on port ${this._proxy.port}`);
     } catch (err) {
       this.log(`Failed to start proxy: ${err}`);
     }
+  }
+
+  private onWorkspaceFoldersChanged(): void {
+    this._proxy?.setWorkspaceFolder(this.getWorkspaceFolder());
   }
 
   private async stopProxy(): Promise<void> {
@@ -590,8 +612,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       "font-src 'self' data:;",
     ].join(' ');
 
+    const workspaceDir = this.getWorkspaceFolder();
+    const workspaceQuery = workspaceDir
+      ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}`
+      : '';
+
     const iframeSrc = showIframe
-      ? `src="${escapeAttr(proxyUrl)}"` : '';
+      ? `src="${escapeAttr(proxyUrl + workspaceQuery)}"` : '';
+
+    this.log(`iframe URL: ${proxyUrl}${workspaceQuery} (showIframe=${showIframe})`);
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -655,7 +684,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     <a onclick="closePanel()" style="margin-left:8px">Close</a>
   </div>
 
-  <iframe id="ocFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+  <iframe id="ocFrame" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
     ${iframeSrc}></iframe>
 
   <div id="overlay" class="overlay ${showIframe ? 'hidden' : ''}">
@@ -691,6 +720,18 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     function cancelReconnect() {
       vscode.postMessage({ type: 'cancelReconnect' });
+    }
+
+    function sendWorkspace() {
+      const iframe = document.getElementById('ocFrame');
+      const folder = ${JSON.stringify(this.getWorkspaceFolder())};
+      if (iframe && iframe.contentWindow && folder) {
+        const origin = iframe.src ? new URL(iframe.src).origin : '*';
+        const b64 = btoa(folder).replace(/=+$/, '');
+        iframe.contentWindow.postMessage(
+          { type: 'openProject', path: folder, dir: b64, source: 'vscode' }, origin
+        );
+      }
     }
 
     function syncTheme() {

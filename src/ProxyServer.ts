@@ -9,9 +9,10 @@ const BLOCKED_HEADERS = new Set([
 export interface ProxyServer {
   port: number;
   dispose(): void;
+  setWorkspaceFolder(folder: string): void;
 }
 
-export function startProxy(targetUrl: string): Promise<ProxyServer> {
+export function startProxy(targetUrl: string, workspaceFolder = ''): Promise<ProxyServer> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
     const targetHost = parsed.host;
@@ -22,6 +23,7 @@ export function startProxy(targetUrl: string): Promise<ProxyServer> {
         : null;
 
     const baseUrl = `http://${connectHost}`;
+    let currentWorkspace = workspaceFolder;
 
     const server = http.createServer((req, res) => {
       const target = baseUrl + (req.url || '/');
@@ -35,6 +37,9 @@ export function startProxy(targetUrl: string): Promise<ProxyServer> {
       headers['host'] = targetHost;
       if (auth) {
         headers['authorization'] = auth;
+      }
+      if (currentWorkspace) {
+        headers['x-workspace-folder'] = currentWorkspace;
       }
 
       const proxyReq = http.request(target, {
@@ -92,6 +97,7 @@ export function startProxy(targetUrl: string): Promise<ProxyServer> {
       if (addr && typeof addr === 'object') {
         resolve({
           port: addr.port,
+          setWorkspaceFolder: (folder) => { currentWorkspace = folder; },
           dispose: () => server.close(),
         });
       } else {

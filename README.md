@@ -2,26 +2,28 @@
 
 Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sidebar — connects to your server or starts a new one.
 
+💫 Now automatically opens your working project folder in OpenCode Web when you open the sidebar!
+
 ## Features
 
-- :desktop_computer: **Sidebar webview** — loads the OpenCode web UI in the secondary sidebar panel
-- :link: **Status bar indicator** — shows connection state at a glance
-- :rocket: **Start/Stop server** — click a button to run `opencode web` if the server is not running; stop it when done
-- :electric_plug: **Auto-reconnect** — automatically retries when the server is unreachable (with Cancel button)
-- :crescent_moon: **Theme sync** — follows VS Code's light/dark mode automatically
-- :key: **Password support** — credentials stored securely in your OS keychain via VS Code SecretStorage
-- :closed_lock_with_key: **Env var fallback** — reads `OPENCODE_SERVER_PASSWORD` if no password is stored
-- :file_folder: **Open files** — open files in VS Code directly from the webview
-- :globe_with_meridians: **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding
+- 🖥️ **Sidebar webview** — loads the OpenCode web UI in the secondary sidebar panel
+- 🔔 **Status bar indicator** — shows connection state at a glance
+- 🚀 **Start/Stop server** — click a button to run `opencode web` if the server is not running; stop it when done
+- 🔃 **Auto-reconnect** — automatically retries when the server is unreachable (with Cancel button)
+- 🎨 **Theme sync** — follows VS Code's light/dark mode automatically
+- 🔑 **Password support** — credentials stored securely in your OS keychain via VS Code SecretStorage
+- 🔐 **Env var fallback** — reads `OPENCODE_SERVER_PASSWORD` if no password is stored
+- 📁 **Open files** — open files in VS Code directly from the webview
+- 🌐 **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding
 
-## :exclamation:Important: requirements
+## ❗ Important: requirements
 
-:x: This extension does not include or install `opencode` :point_right: You need to have `opencode` already installed and configured.
+❌ This extension does not include or install `opencode` ➡️ You need to have `opencode` already installed and configured.
 
-- If you want to start the `opencode web server` yourself this extension will connect to it automatically :point_right: Start the opencode web server in your preferred location (Local/LAN, Mac/Linux/Windows/WSL...), open the `OpenCode Sidebar` and it will connect to your server (you can customize the URL, user and password in the extension `Settings`)
-- This extension can also start the web server for you on this machine :point_right: Click `Start OpenCode Web Server`. It will start it only once and other windows can reuse the same web server.
+- If you want to start the `opencode web server` yourself this extension will connect to it automatically ➡️ Start the opencode web server in your preferred location (Local/LAN, Mac/Linux/Windows/WSL...), open the **OpenCode Sidebar GUI (web)** and it will connect to your server (you can customize the URL, user and password in the extension **Settings**).
+- This extension can also start the web server for you on this machine ➡️ Click **Start OpenCode Web Server**. It will start it only once and other windows can reuse the same web server.
 
-For more opencode web server config info see the official docs for [OpenCode Web](https://opencode.ai/docs/web/) .
+For more opencode web server config info see the official docs for [OpenCode Web](https://opencode.ai/docs/web/).
 
 ## Commands
 
