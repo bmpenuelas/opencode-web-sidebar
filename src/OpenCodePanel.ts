@@ -154,9 +154,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this._view = undefined;
     this.stopPolling();
     try {
-      await vscode.commands.executeCommand('workbench.action.agentToggleSecondarySidebarVisibility');
+      await vscode.commands.executeCommand('workbench.action.toggleAuxiliaryBar');
     } catch {
-      await vscode.commands.executeCommand('workbench.action.toggleSecondarySidebarVisibility');
+      vscode.window.showErrorMessage('Failed to close sidebar panel');
     }
   }
 

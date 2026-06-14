@@ -1,8 +1,10 @@
-# OpenCode Sidebar GUI (web)
+# OpenCode Sidebar GUI
 
 Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sidebar — connects to your server or starts a new one.
 
 💫 Now automatically opens your working project folder in OpenCode Web when you open the sidebar!
+
+![screenshot](media/screenshot_0.png)
 
 ## Features
 
@@ -20,7 +22,7 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 
 ❌ This extension does not include or install `opencode` ➡️ You need to have `opencode` already installed and configured.
 
-- If you want to start the `opencode web server` yourself this extension will connect to it automatically ➡️ Start the opencode web server in your preferred location (Local/LAN, Mac/Linux/Windows/WSL...), open the **OpenCode Sidebar GUI (web)** and it will connect to your server (you can customize the URL, user and password in the extension **Settings**).
+- If you want to start the `opencode web server` yourself this extension will connect to it automatically ➡️ Start the opencode web server in your preferred location (Local/LAN, Mac/Linux/Windows/WSL...), open the **OpenCode Sidebar** and it will connect to your server (you can customize the URL, user and password in the extension **Settings**).
 - This extension can also start the web server for you on this machine ➡️ Click **Start OpenCode Web Server**. It will start it only once and other windows can reuse the same web server.
 
 For more opencode web server config info see the official docs for [OpenCode Web](https://opencode.ai/docs/web/).

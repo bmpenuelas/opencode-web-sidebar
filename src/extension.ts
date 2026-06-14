@@ -92,6 +92,10 @@ export function activate(context: vscode.ExtensionContext) {
       panel?.onUrlChanged();
     }
   });
+
+  setTimeout(() => {
+    vscode.commands.executeCommand('workbench.view.extension.opencode-web-sidebar');
+  }, 500);
 }
 
 export function deactivate() {
