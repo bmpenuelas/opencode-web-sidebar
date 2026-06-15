@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { spawn, type ChildProcess } from 'child_process';
-import { startProxy, type ProxyServer } from './ProxyServer';
+import { getOrCreateProxy } from './ProxyServer';
 
 function escapeAttr(text: string): string {
   return text.replace(/"/g, '&quot;');
@@ -22,7 +22,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _isReconnecting = false;
   private _cachedUsername = '';
   private _cachedPassword = '';
-  private _proxy: ProxyServer | undefined;
+  private _proxyPort: number | undefined;
+  private _proxyDispose: (() => Promise<void>) | undefined;
   private _proxyBaseUrl: string | undefined;
   private _serverProcess: ChildProcess | undefined;
   private _serverProcessId = 0;
@@ -39,7 +40,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this.loadCachedCredentials();
     this.updateStatusBar();
     vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
-    vscode.workspace.onDidChangeWorkspaceFolders(() => this.onWorkspaceFoldersChanged());
   }
 
   private log(msg: string): void {
@@ -169,6 +169,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   async onUrlChanged(): Promise<void> {
     this.log('URL config changed');
+    this._connectionState = 'checking';
+    this._isReconnecting = false;
+    this._reconnectAttempts = 0;
+    this.clearReconnectTimer();
+    this.updateStatusBar();
+    this.render();
     await this.startProxy();
     await this.pollOnce();
   }
@@ -228,10 +234,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         parsed.password = this._cachedPassword;
       }
       const targetUrl = parsed.toString();
-      const wsFolder = this.getWorkspaceFolder();
-      this.log(`Starting proxy for ${parsed.host} workspace=${wsFolder || '(none)'}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
-      this._proxy = await startProxy(targetUrl, wsFolder);
-      this.log(`Proxy listening on port ${this._proxy.port}`);
+      this.log(`Starting proxy for ${parsed.host}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
+      const handle = await getOrCreateProxy(targetUrl);
+      this._proxyPort = handle.port;
+      this._proxyDispose = handle.dispose;
+      this.log(`Proxy listening on port ${this._proxyPort}`);
       this._proxyBaseUrl = await this.resolveProxyBaseUrl();
     } catch (err) {
       this.log(`Failed to start proxy: ${err}`);
@@ -240,8 +247,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   private async resolveProxyBaseUrl(): Promise<string | undefined> {
     try {
-      if (this._proxy && vscode.env.remoteName) {
-        const uri = vscode.Uri.parse(`http://127.0.0.1:${this._proxy.port}`);
+      if (this._proxyPort && vscode.env.remoteName) {
+        const uri = vscode.Uri.parse(`http://127.0.0.1:${this._proxyPort}`);
         const external = await vscode.env.asExternalUri(uri);
         const result = external.toString().replace(/\/$/, '');
         this.log(`Resolved proxy URL (remote=${vscode.env.remoteName}): ${result}`);
@@ -253,16 +260,13 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     return undefined;
   }
 
-  private onWorkspaceFoldersChanged(): void {
-    this._proxy?.setWorkspaceFolder(this.getWorkspaceFolder());
-  }
-
   private async stopProxy(): Promise<void> {
-    if (this._proxy) {
+    if (this._proxyDispose) {
       this.log('Stopping proxy');
-      this._proxy.dispose();
-      this._proxy = undefined;
+      await this._proxyDispose();
+      this._proxyDispose = undefined;
     }
+    this._proxyPort = undefined;
     this._proxyBaseUrl = undefined;
   }
 
@@ -393,12 +397,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._statusBarItem.show();
     } else if (this._connectionState === 'starting') {
       this._statusBarItem.text = '$(globe) OpenCode: Starting...';
-      this._statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      this._statusBarItem.backgroundColor = undefined;
       this._statusBarItem.tooltip = 'Starting OpenCode server...';
       this._statusBarItem.show();
     } else if (this._isReconnecting) {
       this._statusBarItem.text = '$(globe) OpenCode: Reconnecting...';
-      this._statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+      this._statusBarItem.backgroundColor = undefined;
       this._statusBarItem.tooltip = 'Attempting to reconnect to OpenCode server';
       this._statusBarItem.show();
     } else if (this._connectionState === 'connected') {
@@ -408,7 +412,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._statusBarItem.show();
     } else if (this._connectionState === 'auth-required') {
       this._statusBarItem.text = '$(key) OpenCode: Password Required';
-      this._statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      this._statusBarItem.backgroundColor = undefined;
       this._statusBarItem.tooltip = 'OpenCode server requires a password — click to open panel';
       this._statusBarItem.show();
     } else {
@@ -557,12 +561,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   private getHtmlContent(): string {
     const url = this.getConfiguredUrl();
-    const proxyUrl = this._proxyBaseUrl || (this._proxy
-      ? `http://127.0.0.1:${this._proxy.port}`
+    const proxyUrl = this._proxyBaseUrl || (this._proxyPort
+      ? `http://127.0.0.1:${this._proxyPort}`
       : '');
     const origin = this.getUrlOrigin(url);
 
-    this.log(`Generating HTML (state=${this._connectionState}, proxyPort=${this._proxy?.port ?? 'none'})`);
+    this.log(`Generating HTML (state=${this._connectionState}, proxyPort=${this._proxyPort ?? 'none'})`);
 
     let statusColor: string;
     let statusText: string;
@@ -627,7 +631,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       : '';
     const proxyOrigin = this._proxyBaseUrl
       ? new URL(this._proxyBaseUrl).origin
-      : (this._proxy ? `http://127.0.0.1:${this._proxy.port}` : '');
+      : (this._proxyPort ? `http://127.0.0.1:${this._proxyPort}` : '');
     const frameSrc = proxyOrigin
       ? `frame-src ${proxyOrigin};`
       : origin
