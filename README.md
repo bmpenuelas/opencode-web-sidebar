@@ -17,6 +17,7 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 - 🔐 **Env var fallback** — reads `OPENCODE_SERVER_PASSWORD` if no password is stored
 - 📁 **Open files** — open files in VS Code directly from the webview
 - 🌐 **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding
+- 🔗 **Remote SSH** — works with [VSCode Remote SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) via automatic port forwarding
 
 ## ❗ Important: requirements
 
@@ -24,6 +25,18 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 
 - If you want to start the `opencode web server` yourself this extension will connect to it automatically ➡️ Start the opencode web server in your preferred location (Local/LAN, Mac/Linux/Windows/WSL...), open the **OpenCode Sidebar** and it will connect to your server (you can customize the URL, user and password in the extension **Settings**).
 - This extension can also start the web server for you on this machine ➡️ Click **Start OpenCode Web Server**. It will start it only once and other windows can reuse the same web server.
+
+<br/>
+
+To start the web server:
+
+`opencode web --port 4096` To start the web server for your machine only.
+
+`opencode serve --hostname 0.0.0.0 --port 4096` To start the web server and make it reachable in your whole LAN.
+
+ℹ️ If you run the web server on WSL or Linux, and run the extension on Windows, you need to enable path conversion via the `opencode-web-sidebar.workspacePathStyle` setting (set it to **WSL / Linux**).
+
+<br/>
 
 For more opencode web server config info see the official docs for [OpenCode Web](https://opencode.ai/docs/web/).
 
@@ -52,6 +65,7 @@ All commands are available via the Command Palette (`Ctrl+Shift+P`).
 | `opencode-web-sidebar.autoReconnect` | `true` | Automatically retry when the server is unreachable |
 | `opencode-web-sidebar.maxReconnectAttempts` | `0` | Maximum reconnection attempts (0 = unlimited) |
 | `opencode-web-sidebar.serverCommand` | `opencode web --port 4096` | Shell command to start the server (split by whitespace) |
+| `opencode-web-sidebar.workspacePathStyle` | `none` | Path translation mode for workspace folder: `Do not translate` (pass raw path), `WSL / Linux` (convert `C:\...` to `/mnt/c/...` for WSL/Linux servers) |
 
 ## Panel controls
 

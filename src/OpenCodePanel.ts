@@ -23,6 +23,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _cachedUsername = '';
   private _cachedPassword = '';
   private _proxy: ProxyServer | undefined;
+  private _proxyBaseUrl: string | undefined;
   private _serverProcess: ChildProcess | undefined;
   private _serverProcessId = 0;
   private _startedByUs = false;
@@ -231,9 +232,25 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this.log(`Starting proxy for ${parsed.host} workspace=${wsFolder || '(none)'}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
       this._proxy = await startProxy(targetUrl, wsFolder);
       this.log(`Proxy listening on port ${this._proxy.port}`);
+      this._proxyBaseUrl = await this.resolveProxyBaseUrl();
     } catch (err) {
       this.log(`Failed to start proxy: ${err}`);
     }
+  }
+
+  private async resolveProxyBaseUrl(): Promise<string | undefined> {
+    try {
+      if (this._proxy && vscode.env.remoteName) {
+        const uri = vscode.Uri.parse(`http://127.0.0.1:${this._proxy.port}`);
+        const external = await vscode.env.asExternalUri(uri);
+        const result = external.toString().replace(/\/$/, '');
+        this.log(`Resolved proxy URL (remote=${vscode.env.remoteName}): ${result}`);
+        return result;
+      }
+    } catch (err) {
+      this.log(`Failed to resolve proxy external URL: ${err}`);
+    }
+    return undefined;
   }
 
   private onWorkspaceFoldersChanged(): void {
@@ -246,6 +263,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._proxy.dispose();
       this._proxy = undefined;
     }
+    this._proxyBaseUrl = undefined;
   }
 
   private async restartProxy(): Promise<void> {
@@ -539,9 +557,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   private getHtmlContent(): string {
     const url = this.getConfiguredUrl();
-    const proxyUrl = this._proxy
+    const proxyUrl = this._proxyBaseUrl || (this._proxy
       ? `http://127.0.0.1:${this._proxy.port}`
-      : '';
+      : '');
     const origin = this.getUrlOrigin(url);
 
     this.log(`Generating HTML (state=${this._connectionState}, proxyPort=${this._proxy?.port ?? 'none'})`);
@@ -607,9 +625,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const statusBarStop = this._startedByUs
       ? '<a onclick="stopServer()">Stop</a>'
       : '';
-    const proxyOrigin = proxyUrl
-      ? `http://127.0.0.1:${this._proxy!.port}`
-      : '';
+    const proxyOrigin = this._proxyBaseUrl
+      ? new URL(this._proxyBaseUrl).origin
+      : (this._proxy ? `http://127.0.0.1:${this._proxy.port}` : '');
     const frameSrc = proxyOrigin
       ? `frame-src ${proxyOrigin};`
       : origin
@@ -631,7 +649,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     const workspaceDir = this.getWorkspaceFolder();
     const workspaceQuery = workspaceDir
-      ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}`
+      ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}/session`
       : '';
 
     const iframeSrc = showIframe

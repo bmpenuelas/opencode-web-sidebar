@@ -165,7 +165,11 @@
             "none",
             "wsl"
           ],
-          "description": "Path translation mode for the X-Workspace-Folder header: 'none' (pass raw path), 'wsl' (convert C:\\... to /mnt/c/... for WSL servers)"
+          "enumItemLabels": [
+            "Do not translate",
+            "WSL / Linux"
+          ],
+          "description": "Path translation mode for the X-Workspace-Folder header sent to the opencode web server"
         }
       }
     }
