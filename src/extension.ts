@@ -4,7 +4,7 @@ import { OpenCodePanel } from './OpenCodePanel';
 let panel: OpenCodePanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-  panel = new OpenCodePanel(context.extensionUri, context.secrets);
+  panel = new OpenCodePanel(context.extensionUri, context.secrets, context.globalState);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(OpenCodePanel.viewType, panel)
@@ -92,7 +92,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration('opencode-web-sidebar.url')) {
+    if (e.affectsConfiguration('opencode-web-sidebar.url') ||
+        e.affectsConfiguration('opencode-web-sidebar.servers')) {
       panel?.onUrlChanged();
     }
   });

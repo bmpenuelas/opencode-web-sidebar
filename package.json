@@ -136,7 +136,35 @@
         "opencode-web-sidebar.url": {
           "type": "string",
           "default": "http://localhost:4096",
-          "description": "URL of the OpenCode web UI to embed in the sidebar panel"
+          "description": "URL of the OpenCode web UI to embed in the sidebar panel (deprecated: use servers list instead)"
+        },
+        "opencode-web-sidebar.servers": {
+          "type": "array",
+          "default": [
+            {
+              "id": "default",
+              "url": "http://localhost:4096",
+              "label": "Local Server",
+              "isWsl": false,
+              "isDefault": true,
+              "serverCommand": "opencode web --port 4096"
+            }
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "description": "Unique identifier for this server" },
+              "url": { "type": "string", "description": "URL of the server" },
+              "label": { "type": "string", "description": "Display label for the server" },
+              "isWsl": { "type": "boolean", "description": "Translate workspace paths for WSL/Linux" },
+              "isDefault": { "type": "boolean", "description": "Whether this is the default server" },
+              "serverCommand": { "type": "string", "description": "Command to start the server locally" },
+              "username": { "type": "string", "description": "Username for authentication" },
+              "authEnabled": { "type": "boolean", "description": "Enable authentication fields" }
+            },
+            "required": ["id", "url"]
+          },
+          "description": "List of configured OpenCode servers"
         },
         "opencode-web-sidebar.hideButton": {
           "type": "boolean",
@@ -156,7 +184,7 @@
         "opencode-web-sidebar.serverCommand": {
           "type": "string",
           "default": "opencode web --port 4096",
-          "description": "Command to start the OpenCode web server. Split into executable and arguments by whitespace."
+          "description": "Command to start the OpenCode web server (deprecated: use per-server serverCommand instead)"
         },
         "opencode-web-sidebar.workspacePathStyle": {
           "type": "string",
@@ -169,7 +197,7 @@
             "Do not translate",
             "WSL / Linux"
           ],
-          "description": "Path translation mode for the X-Workspace-Folder header sent to the opencode web server"
+          "description": "Path translation mode (deprecated: use per-server isWsl instead)"
         }
       }
     }
