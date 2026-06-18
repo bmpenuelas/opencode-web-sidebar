@@ -37,6 +37,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _activeServerId = '';
   private _serverGeneration = 0;
   private _showServerSelector = false;
+  private _pendingChanges = new Map<string, Record<string, any>>();
+  private _serverStatuses = new Map<string, ConnectionState | 'unknown'>();
+  private _allServersPollTimer: ReturnType<typeof setInterval> | undefined;
   private _proxyPort: number | undefined;
   private _proxyDispose: (() => Promise<void>) | undefined;
   private _proxyBaseUrl: string | undefined;
@@ -177,6 +180,37 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     return this._servers.find(s => s.id === this._activeServerId);
   }
 
+  private renderCurrentServerCard(): string {
+    const server = this.getActiveServer();
+    if (!server) return '';
+
+    let dotClass = 'status-dot';
+    let statusLabel = '';
+    if (this._connectionState === 'connected') { dotClass += ' connected'; statusLabel = 'Connected'; }
+    else if (this._connectionState === 'checking') { dotClass += ' pulse'; statusLabel = 'Connecting...'; }
+    else if (this._connectionState === 'starting') { dotClass += ' pulse'; statusLabel = 'Starting...'; }
+    else if (this._connectionState === 'auth-required') { dotClass += ' auth'; statusLabel = 'Password required'; }
+    else if (this._isReconnecting) { dotClass += ' pulse'; statusLabel = 'Reconnecting...'; }
+    else { dotClass += ' disconnected'; statusLabel = 'Disconnected'; }
+
+    const label = escapeAttr(server.label || server.url);
+    const url = escapeAttr(server.url);
+
+    return `<div class="card" style="cursor:pointer;width:100%;max-width:400px" onclick="selectServer()">
+      <div class="card-header">
+        <div class="card-title">
+          <span>${label}</span>
+          <span class="${dotClass}"></span>
+        </div>
+        <div class="card-description">${url}</div>
+      </div>
+      <div class="card-content" style="flex-direction:row;justify-content:space-between;align-items:center;padding-top:2px">
+        <span style="font-size:11px;color:var(--muted-foreground)">${statusLabel}</span>
+        <span style="font-size:11px;color:var(--muted-foreground)">Manage &rarr;</span>
+      </div>
+    </div>`;
+  }
+
   private async saveServerPassword(serverId: string, password: string): Promise<void> {
     this.log(`Saving password for server ${serverId}`);
     if (password) {
@@ -218,6 +252,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this._reconnectAttempts = 0;
     this.clearReconnectTimer();
     this._showServerSelector = false;
+    if (this._allServersPollTimer) {
+      clearInterval(this._allServersPollTimer);
+      this._allServersPollTimer = undefined;
+    }
+    this._serverStatuses.clear();
 
     if (this._startedByUs && this._serverProcess && serverId !== this._activeServerId) {
       this.log('Stopping previously-started server on switch');
@@ -226,6 +265,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
     }
 
+    await this.commitPendingChanges(serverId);
     this._activeServerId = serverId;
     await this._globalState.update('opencode-web-sidebar.activeServerId', serverId);
     this.loadCredentialsForActive();
@@ -306,10 +346,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   private async addServer(config: { url: string; label?: string; isWsl?: boolean }): Promise<void> {
     const id = `srv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const count = this._servers.filter(s => s.id !== 'default').length + 1;
     this._servers.push({
       id,
       url: config.url,
-      label: config.label || config.url,
+      label: config.label || `Server #${count}`,
+      authEnabled: false,
       isWsl: config.isWsl || false,
       isDefault: false,
     });
@@ -370,6 +412,16 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           break;
         case 'selectServer':
           this._showServerSelector = !this._showServerSelector;
+          if (this._showServerSelector) {
+            this.pollAllServers();
+            this._allServersPollTimer = setInterval(() => this.pollAllServers(), 5000);
+          } else {
+            if (this._allServersPollTimer) {
+              clearInterval(this._allServersPollTimer);
+              this._allServersPollTimer = undefined;
+            }
+            this._serverStatuses.clear();
+          }
           this.sendStateUpdate();
           break;
         case 'connectToServer':
@@ -379,8 +431,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           break;
         case 'startAndConnect':
           if (msg.serverId) {
+            await this.commitPendingChanges(msg.serverId);
             const gen = ++this._serverGeneration;
             this._showServerSelector = false;
+            if (this._allServersPollTimer) {
+              clearInterval(this._allServersPollTimer);
+              this._allServersPollTimer = undefined;
+            }
+            this._serverStatuses.clear();
             this._activeServerId = msg.serverId;
             await this._globalState.update('opencode-web-sidebar.activeServerId', msg.serverId);
             this.loadCredentialsForActive();
@@ -414,7 +472,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           break;
         case 'removeServer':
           if (msg.serverId) {
-            await this.removeServer(msg.serverId);
+            const result = await vscode.window.showWarningMessage('Remove this server?', { modal: true }, 'Remove');
+            if (result === 'Remove') {
+              this._pendingChanges.delete(msg.serverId);
+              await this.removeServer(msg.serverId);
+            }
           }
           break;
         case 'setDefaultServer':
@@ -425,6 +487,19 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         case 'addServer':
           await this.addServer(msg.config);
           break;
+        case 'pendingChange':
+          if (msg.serverId) {
+            const existing = this._pendingChanges.get(msg.serverId) || {};
+            existing[msg.key] = msg.value;
+            this._pendingChanges.set(msg.serverId, existing);
+            this.sendStateUpdate();
+          }
+          break;
+        case 'commitServerChanges':
+          if (msg.serverId) {
+            await this.commitPendingChanges(msg.serverId);
+          }
+          break;
       }
     });
 
@@ -432,6 +507,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._view = undefined;
       this._isVisible = false;
       this.stopPolling();
+      if (this._allServersPollTimer) {
+        clearInterval(this._allServersPollTimer);
+        this._allServersPollTimer = undefined;
+      }
+      this._serverStatuses.clear();
       this.log('Webview disposed');
     });
 
@@ -577,33 +657,36 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     } else if (!url) {
       overlayContent =
         '<span>No URL configured. Configure a server below.</span>' +
-        '<div class="btn-row"><button onclick="selectServer()">Servers</button></div>';
-    } else if (this._isReconnecting) {
-      overlayContent =
+        '<div class="btn-row"><button class="btn btn-default" onclick="selectServer()">Servers</button></div>';
+    } else {
+      const card = this.renderCurrentServerCard();
+      const statusHtml = this._isReconnecting ? (
         '<span>Connection lost, reconnecting...</span>' +
-        '<div class="btn-row"><button onclick="cancelReconnect()">Cancel</button>' +
-        '<button onclick="selectServer()">Servers</button></div>';
-    } else if (this._connectionState === 'checking') {
-      overlayContent =
+        '<div class="btn-row"><button class="btn btn-default" onclick="cancelReconnect()">Cancel</button>' +
+        '<button class="btn btn-outline" onclick="selectServer()">Servers</button></div>'
+      ) : this._connectionState === 'checking' ? (
         '<div class="oc-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="40" height="40" fill="none"><path fill="#f1ecec" d="M180 60H60v180h120zm60 240H0V0h240z" clip-path="url(#b)" mask="url(#a)" transform="translate(30)"/><defs><clipPath id="b" clipPathUnits="userSpaceOnUse"><path fill="#fff" d="M0 0h240v300H0z"/></clipPath><mask id="a" maskUnits="userSpaceOnUse"><path fill="#fff" d="M240 0H0v300h240z"/></mask></defs></svg></div>' +
         '<div class="spinner"></div>' +
-        '<span>Connecting to server...</span>';
-    } else if (this._connectionState === 'starting') {
-      overlayContent =
+        '<span>Connecting to server...</span>'
+      ) : this._connectionState === 'starting' ? (
         '<div class="spinner"></div>' +
-        '<span>Starting OpenCode server...</span>';
-    } else if (this._connectionState === 'auth-required') {
-      overlayContent =
+        '<span>Starting OpenCode server...</span>'
+      ) : this._connectionState === 'auth-required' ? (
         '<div class="lock-icon">🔒</div>' +
         '<span>Server is online but password protected</span>' +
-        '<div class="btn-row"><button onclick="setPassword()">Login with Username &amp; Password</button></div>';
-    } else if (this._connectionState === 'disconnected') {
-      overlayContent =
+        '<div class="btn-row"><button class="btn btn-default" onclick="setPassword()">Login with Username &amp; Password</button></div>'
+      ) : this._connectionState === 'disconnected' ? (
         '<span>OpenCode server is not reachable</span>' +
-        '<div class="btn-row"><button onclick="selectServer()">Servers</button>' +
-        '<button onclick="openSettings()">Settings</button></div>';
-    } else {
-      overlayContent = '';
+        '<div class="btn-row"><button class="btn btn-default" onclick="selectServer()">Servers</button>' +
+        '<button class="btn btn-outline" onclick="openSettings()">Settings</button></div>'
+      ) : '';
+
+      overlayContent = card
+        ? `<div style="display:flex;flex-direction:column;width:100%;height:100%;align-items:center">
+            <div style="display:flex;flex-direction:column;align-items:center;width:100%;padding:32px 12px 0;flex-shrink:0">${card}</div>
+            <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;width:100%">${statusHtml}</div>
+          </div>`
+        : statusHtml;
     }
 
     const proxyUrl = this._proxyBaseUrl || (this._proxyPort
@@ -842,6 +925,47 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
   }
 
+  private async pollAllServers(): Promise<void> {
+    const gen = this._serverGeneration;
+    for (const server of this._servers) {
+      if (server.id === this._activeServerId) continue;
+      try {
+        const resp = await fetch(server.url, {
+          method: 'HEAD',
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          this._serverStatuses.set(server.id, 'connected');
+        } else if (resp.status >= 500) {
+          this._serverStatuses.set(server.id, 'disconnected');
+        } else {
+          this._serverStatuses.set(server.id, 'connected');
+        }
+      } catch {
+        this._serverStatuses.set(server.id, 'disconnected');
+      }
+      if (this._disposed || gen !== this._serverGeneration) { return; }
+    }
+    this.sendStateUpdate();
+  }
+
+  private async commitPendingChanges(serverId: string): Promise<void> {
+    const pending = this._pendingChanges.get(serverId);
+    if (!pending) return;
+    const server = this._servers.find(s => s.id === serverId);
+    if (!server) { this._pendingChanges.delete(serverId); return; }
+    if ('password' in pending) {
+      await this.saveServerPassword(serverId, pending.password || '');
+    }
+    for (const key of Object.keys(pending)) {
+      if (key === 'password') continue;
+      (server as any)[key] = pending[key];
+    }
+    this._pendingChanges.delete(serverId);
+    await this.persistServers();
+    this.sendStateUpdate();
+  }
+
   private async checkHealth(): Promise<ConnectionState> {
     const url = this.getConfiguredUrl();
     if (!url) { return 'disconnected'; }
@@ -871,6 +995,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
 
       if (resp.status === 401) { return 'auth-required'; }
+      if (resp.status >= 500) {
+        this.log(`Health check: upstream unavailable (${resp.status})`);
+        return 'disconnected';
+      }
       return 'connected';
     } catch {
       this.log('Health check failed (server unreachable)');
@@ -959,6 +1087,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       if (gen === this._serverGeneration) {
         this.sendStateUpdate();
       }
+      this.scheduleReconnect();
     } else {
       this._consecutiveHealthFailures++;
       if (this._consecutiveHealthFailures < 2 && this._connectionState === 'connected') {
@@ -1024,76 +1153,100 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private renderServerRow(server: ServerConfig, isLocal: boolean): string {
     const activeId = this._activeServerId;
     const isActive = server.id === activeId;
+    const pending = this._pendingChanges.get(server.id);
+    const hasPending = !!pending;
+    const label = pending?.label ?? server.label ?? '';
+    const url = pending?.url ?? server.url;
+    const serverUsername = pending?.username ?? server.username ?? '';
+    const authEnabled = pending?.authEnabled ?? server.authEnabled ?? true;
+    const isWsl = pending?.isWsl ?? server.isWsl ?? false;
     const hasPassword = !!(this._passwordsCache.get(server.id));
     const usingEnv = isActive && this._usingEnvPassword && !hasPassword;
     const isDefault = server.isDefault;
-    const authEnabled = server.authEnabled ?? true;
 
-    const urlValue = escapeAttr(server.url);
+    const urlValue = escapeAttr(url);
 
-    let actions: string;
-
-    if (isLocal) {
-      const showStartAndConnect = !isActive;
-      actions = `<div class="srv-actions srv-actions-local">`;
-      if (showStartAndConnect) {
-        actions += `<button class="srv-btn srv-btn-primary" onclick="startAndConnect('${server.id}')">START AND CONNECT</button>`;
-      } else {
-        actions += `<div class="srv-spacer"></div>`;
-      }
-      if (isActive) {
-        actions += `<div class="srv-active-badge">ACTIVE</div>`;
-      } else {
-        actions += `<button class="srv-btn" onclick="connectToServer('${server.id}')">CONNECT</button>`;
-      }
-      const showDefaultBadge = isDefault;
-      if (showDefaultBadge) {
-        actions += `<span class="srv-default-badge srv-default-visible">default</span>`;
-      } else {
-        actions += `<span class="srv-default-badge"></span>`;
-      }
-      actions += `</div>`;
+    let statusClass = 'status-dot';
+    if (isActive) {
+      if (this._connectionState === 'connected') statusClass += ' connected';
+      else if (this._connectionState === 'checking' || this._connectionState === 'starting') statusClass += ' pulse';
+      else if (this._connectionState === 'auth-required') statusClass += ' auth';
+      else statusClass += ' disconnected';
     } else {
-      actions = `<div class="srv-actions">`;
-      if (isActive) {
-        actions += `<div class="srv-active-badge">ACTIVE</div>`;
-      } else {
-        actions += `<button class="srv-btn" onclick="connectToServer('${server.id}')">CONNECT</button>`;
-      }
-      if (isDefault) {
-        actions += `<span class="srv-default-badge"></span>`;
-      } else {
-        actions += `<span class="srv-default-badge srv-default-hover" onclick="setDefaultServer('${server.id}')">default</span>`;
-      }
-      actions += `</div>`;
+      const s = this._serverStatuses.get(server.id) || 'unknown';
+      if (s === 'connected') statusClass += ' connected';
+      else if (s === 'auth-required') statusClass += ' auth';
+      else statusClass += ' disconnected';
     }
+
+    let action: string;
+    if (isLocal) {
+      if (isActive) {
+        action = `<span class="badge badge-active">ACTIVE</span>`;
+      } else {
+        action = `<div class="btn-row">
+          <button class="btn btn-outline btn-xs" onclick="startAndConnect('${server.id}')">Start &amp; Connect</button>
+          <button class="btn btn-default btn-xs" onclick="connectToServer('${server.id}')">Connect</button>
+        </div>`;
+      }
+    } else {
+      if (isActive) {
+        action = `<span class="badge badge-active">ACTIVE</span>`;
+      } else {
+        action = `<button class="btn btn-default btn-xs" onclick="connectToServer('${server.id}')">Connect</button>`;
+      }
+    }
+
+    let footerLeft = '';
+    if (isDefault) {
+      footerLeft = `<span class="badge badge-outline">default</span>`;
+    } else {
+      footerLeft = `<button class="btn btn-ghost btn-xs" onclick="setDefaultServer('${server.id}')">Set Default</button>`;
+    }
+
+    const trashSvg = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="pointer-events:none;display:block"><path d="M6.5 1.5H5V3h6V1.5H9.5L9 1H7L6.5 1.5zM3 4v1h1v9.5c0 .3.2.5.5.5h7c.3 0 .5-.2.5-.5V5h1V4H3zm2 1h6v9H5V5z"/></svg>';
+    const saveSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="pointer-events:none;display:block"><path fill-rule="evenodd" clip-rule="evenodd" d="M18.1716 1C18.702 1 19.2107 1.21071 19.5858 1.58579L22.4142 4.41421C22.7893 4.78929 23 5.29799 23 5.82843V20C23 21.6569 21.6569 23 20 23H4C2.34315 23 1 21.6569 1 20V4C1 2.34315 2.34315 1 4 1H18.1716ZM4 3C3.44772 3 3 3.44772 3 4V20C3 20.5523 3.44772 21 4 21L5 21L5 15C5 13.3431 6.34315 12 8 12L16 12C17.6569 12 19 13.3431 19 15V21H20C20.5523 21 21 20.5523 21 20V6.82843C21 6.29799 20.7893 5.78929 20.4142 5.41421L18.5858 3.58579C18.2107 3.21071 17.702 3 17.1716 3H17V5C17 6.65685 15.6569 8 14 8H10C8.34315 8 7 6.65685 7 5V3H4ZM17 21V15C17 14.4477 16.5523 14 16 14L8 14C7.44772 14 7 14.4477 7 15L7 21L17 21ZM9 3H15V5C15 5.55228 14.5523 6 14 6H10C9.44772 6 9 5.55228 9 5V3Z"/></svg>';
+    const saveBtn = hasPending
+      ? `<span class="btn btn-default btn-xs" onclick="commitServerChanges('${server.id}')" title="Save changes" role="button" tabindex="0" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px">SAVE ${saveSvg}</span>`
+      : '';
 
     const userPlaceholder = (usingEnv && !server.username) ? '[Using opencode]' : 'Username';
     const passPlaceholder = usingEnv ? '[Using OPENCODE_SERVER_PASSWORD]' : hasPassword ? '••••••••' : 'Password';
     const authFieldsStyle = authEnabled ? '' : ' style="display:none"';
 
-    const fields = `<div class="srv-fields">
-      <input class="srv-url" type="text" value="${urlValue}" onchange="updateServerConfig('${server.id}','url',this.value)" placeholder="http://localhost:4096">
-      <div class="srv-field-row"${authFieldsStyle}>
-        <input class="srv-user" id="user-${server.id}" type="text" placeholder="${userPlaceholder}" value="${escapeAttr(server.username || '')}" onchange="updateServerConfig('${server.id}','username',this.value)">
-        <input class="srv-pass" id="pass-${server.id}" type="password" placeholder="${passPlaceholder}" onchange="saveCredentials('${server.id}',this.value)">
+    return `<div class="card" data-id="${server.id}">
+      <div class="card-header">
+        <div class="card-title">
+          <input class="input-title" type="text" value="${escapeAttr(label)}" onchange="pendingChange('${server.id}','label',this.value)" placeholder="Server name" spellcheck="false">
+          ${isActive ? `<span class="${statusClass}"></span>` : ''}
+        </div>
+        <div class="card-description">${urlValue}</div>
+        <div class="card-action">${isActive ? action : `<span class="${statusClass}"></span> ${action}`}</div>
       </div>
-      <div class="srv-toggle-row">
-        <label class="srv-toggle">
-          <input type="checkbox" ${authEnabled ? 'checked' : ''} onchange="updateServerConfig('${server.id}','authEnabled',this.checked)">
-          <span>authentication</span>
-        </label>
-        <label class="srv-toggle">
-          <input type="checkbox" ${server.isWsl ? 'checked' : ''} onchange="updateServerConfig('${server.id}','isWsl',this.checked)">
-          <span>is WSL / Linux</span>
-        </label>
+      <div class="card-content">
+        <input class="input" type="text" value="${urlValue}" onchange="pendingChange('${server.id}','url',this.value)" placeholder="http://localhost:4096">
+        <div class="field-row"${authFieldsStyle}>
+          <input class="input input-sm" id="user-${server.id}" type="text" placeholder="${userPlaceholder}" value="${escapeAttr(serverUsername)}" onchange="pendingChange('${server.id}','username',this.value)">
+          <input class="input input-sm" id="pass-${server.id}" type="password" placeholder="${passPlaceholder}" onchange="pendingChange('${server.id}','password',this.value)">
+        </div>
+        <div class="toggle-row">
+          <label class="switch-label">
+            <input type="checkbox" class="switch-input" ${authEnabled ? 'checked' : ''} onchange="pendingChange('${server.id}','authEnabled',this.checked)">
+            <span>authentication</span>
+          </label>
+          <label class="switch-label">
+            <input type="checkbox" class="switch-input" ${isWsl ? 'checked' : ''} onchange="pendingChange('${server.id}','isWsl',this.checked)">
+            <span>is WSL / Linux</span>
+          </label>
+        </div>
+      </div>
+      <div class="card-footer">
+        ${footerLeft}
+        <div style="flex:1"></div>
+        ${saveBtn}
+        ${isLocal ? '' : `<span class="btn btn-ghost btn-xs" onclick="removeServer('${server.id}')" title="Remove server" role="button" tabindex="0" style="cursor:pointer">${trashSvg}</span>`}
       </div>
     </div>`;
-
-    const trashSvg = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" style="pointer-events:none;display:block;opacity:0.6" title="Remove server"><path d="M6.5 1.5H5V3h6V1.5H9.5L9 1H7L6.5 1.5zM3 4v1h1v9.5c0 .3.2.5.5.5h7c.3 0 .5-.2.5-.5V5h1V4H3zm2 1h6v9H5V5z"/></svg>';
-    const removeBtn = `<div class="srv-remove" onclick="removeServer('${server.id}')">${trashSvg}</div>`;
-
-    return `<div class="srv-row" data-id="${server.id}">${actions}${fields}${removeBtn}</div>`;
   }
 
   private getHtmlContent(): string {
@@ -1110,14 +1263,17 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const proxyOrigin = this._proxyBaseUrl
       ? new URL(this._proxyBaseUrl).origin
       : (this._proxyPort ? `http://127.0.0.1:${this._proxyPort}` : '');
-    const frameSrc = proxyOrigin
-      ? `frame-src ${proxyOrigin};`
-      : origin
-        ? `frame-src ${origin};`
-        : "frame-src http://127.0.0.1:* http://localhost:*;";
+    const frameSrcBase = proxyOrigin || origin;
+    const frameSrc = showIframe && frameSrcBase
+      ? `frame-src ${frameSrcBase};`
+      : "frame-src http://127.0.0.1:* http://localhost:*;";
 
-    const imgSrc = proxyOrigin || origin || 'http://127.0.0.1:* http://localhost:* https:';
-    const connectSrc = proxyOrigin || origin || 'http://127.0.0.1:* http://localhost:*';
+    const imgSrc = showIframe && (proxyOrigin || origin)
+      ? `${proxyOrigin || origin}`
+      : 'http://127.0.0.1:* http://localhost:* https:';
+    const connectSrc = showIframe && (proxyOrigin || origin)
+      ? `${proxyOrigin || origin}`
+      : 'http://127.0.0.1:* http://localhost:*';
 
     const csp = [
       "default-src 'self';",
@@ -1144,10 +1300,31 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <title>OpenCode</title>
   <style>
+    :root {
+      --background: var(--vscode-sideBar-background, #1e1e1e);
+      --foreground: var(--vscode-sideBar-foreground, #cccccc);
+      --card: var(--vscode-sideBar-background, #1e1e1e);
+      --card-foreground: var(--vscode-foreground, #cccccc);
+      --primary: var(--vscode-button-background, #007acc);
+      --primary-foreground: var(--vscode-button-foreground, #ffffff);
+      --secondary: #2d2d2d;
+      --secondary-foreground: #cccccc;
+      --muted: #2d2d2d;
+      --muted-foreground: #888888;
+      --accent: #2d2d2d;
+      --accent-foreground: #cccccc;
+      --destructive: #e06c75;
+      --destructive-foreground: #ffffff;
+      --border: rgba(255,255,255,0.1);
+      --input: rgba(255,255,255,0.15);
+      --ring: rgba(255,255,255,0.3);
+      --radius: 0.625rem;
+    }
     * { margin:0; padding:0; box-sizing:border-box; }
-    html,body { height:100%; width:100%; overflow:hidden; background:var(--vscode-sideBar-background,#1e1e1e); }
-    iframe { width:100%; height:calc(100% - 24px); border:none; }
+    html,body { height:100%; width:100%; overflow:hidden; background:var(--background); color:var(--foreground); font-family:var(--vscode-font-family,sans-serif); font-size:13px; -webkit-font-smoothing:antialiased; }
+    iframe { width:100%; height:calc(100% - 24px); border:none; display:none; }
     input { font-family:inherit; font-size:inherit; }
+
     .status-bar {
       height:24px; display:flex; align-items:center; padding:0 10px;
       font-family:var(--vscode-font-family,sans-serif); font-size:11px;
@@ -1157,7 +1334,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
     .status-bar .dot {
       display:inline-block; width:8px; height:8px; border-radius:50%;
-      background:${statusColor}; flex-shrink:0;
+      flex-shrink:0;
     }
     .status-bar .spacer { flex:1; }
     .status-bar a {
@@ -1165,10 +1342,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
     .status-bar a:hover { opacity:1; text-decoration:underline; }
     .separator { color:inherit; opacity:.35; }
+
     .overlay {
       position:absolute; inset:24px 0 0 0; display:flex; flex-direction:column;
-      align-items:center; justify-content:center; gap:10px;
-      color:var(--vscode-descriptionForeground,#999);
+      align-items:center; justify-content:center; gap:12px;
+      color:var(--muted-foreground);
       font-family:var(--vscode-font-family,sans-serif); font-size:13px;
       padding:20px;
     }
@@ -1176,18 +1354,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     .overlay .lock-icon { font-size:32px; }
     .overlay code { font-size:12px; opacity:.8; }
     .overlay .btn-row { display:flex; gap:8px; margin-top:4px; }
-    .overlay button {
-      padding:8px 16px; border:none; cursor:pointer; border-radius:2px;
-      background:var(--vscode-button-background,#007acc);
-      color:var(--vscode-button-foreground,#fff);
-      font-family:var(--vscode-font-family,sans-serif);
-    }
     .overlay .oc-icon {
       display:flex; align-items:center; justify-content:center; opacity:.5;
       margin-bottom:8px;
     }
     .overlay .spinner {
-      width:24px; height:24px; border:3px solid var(--vscode-descriptionForeground,#999);
+      width:24px; height:24px; border:3px solid var(--muted-foreground);
       border-top-color:transparent; border-radius:50%;
       animation:spin .8s linear infinite;
     }
@@ -1197,101 +1369,156 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       width:100%; height:100%; overflow-y:auto; padding:12px;
       display:flex; flex-direction:column; gap:8px;
     }
-    .server-selector .btn-row {
-      display:flex; gap:8px; justify-content:center; margin-top:8px; flex-shrink:0;
+
+    .card {
+      display:flex; flex-direction:column; gap:12px;
+      border-radius:var(--radius); padding:12px 0;
+      background:var(--card); color:var(--card-foreground);
+      border:1px solid var(--border); overflow:hidden;
     }
-    .server-selector .btn-row button {
-      padding:6px 14px; border:none; cursor:pointer; border-radius:2px;
-      background:var(--vscode-button-background,#007acc);
-      color:var(--vscode-button-foreground,#fff);
-      font-family:var(--vscode-font-family,sans-serif); font-size:12px;
+    .card:has(.card-footer) { padding-bottom:0; }
+    .card-header {
+      display:grid; gap:4px; padding:0 12px;
+      align-items:start; grid-auto-rows:min-content;
     }
-    .server-selector .btn-row button:hover {
-      opacity:.9;
+    .card-header:has(.card-title) { grid-template-columns:1fr auto; }
+    .card-title {
+      font-size:13px; font-weight:500; line-height:1.3;
+      display:flex; align-items:center; gap:6px;
     }
-    .srv-row {
-      display:grid; grid-template-columns:auto 1fr auto; gap:8px;
-      padding:10px; border-radius:4px;
-      background:var(--vscode-sideBar-background,#1e1e1e);
-      border:1px solid var(--vscode-sideBar-border,transparent);
+    .card-title .status-dot { margin-top:4px; }
+    .card-description {
+      font-size:11px; color:var(--muted-foreground); word-break:break-all;
     }
-    .srv-row:hover {
-      background:var(--vscode-list-hoverBackground,#2a2d2e);
+    .card-action {
+      grid-column:2; grid-row:1/span 2; justify-self:end; align-self:start;
+      display:flex; align-items:center; gap:4px;
     }
-    .srv-actions {
-      display:flex; flex-direction:column; gap:4px; align-items:center; justify-content:center; min-width:90px;
+    .card-action .status-dot { margin-top:2px; }
+    .card-content {
+      padding:0 12px; display:flex; flex-direction:column; gap:4px;
     }
-    .srv-actions-local {
-      justify-content:flex-start;
+    .card-footer {
+      display:flex; align-items:center; gap:4px; padding:8px 12px; margin:0;
+      background:color-mix(in srgb,var(--muted) 50%,transparent);
+      border-top:1px solid var(--border);
+      border-radius:0 0 var(--radius) var(--radius);
+      flex-wrap:wrap;
     }
-    .srv-btn {
-      padding:4px 10px; border:none; cursor:pointer; border-radius:2px; font-size:11px; white-space:nowrap;
-      background:var(--vscode-button-background,#007acc);
-      color:var(--vscode-button-foreground,#fff);
-      font-family:var(--vscode-font-family,sans-serif);
+
+    .btn {
+      display:inline-flex; align-items:center; justify-content:center;
+      border-radius:12px; font-size:12px; font-weight:500; line-height:1;
+      white-space:nowrap; transition:all .15s; cursor:pointer;
+      border:1px solid transparent; font-family:inherit; outline:none;
+      height:28px; padding:0 10px; gap:4px;
     }
-    .srv-btn:hover { opacity:.85; }
-    .srv-btn-primary {
-      background:var(--vscode-button-hoverBackground,#006bb3);
+    .btn:hover { opacity:.9; }
+    .btn:active { transform:translateY(1px); }
+    .btn-default {
+      background:var(--primary); color:var(--primary-foreground);
     }
-    .srv-active-badge {
-      padding:4px 10px; border-radius:2px; font-size:11px; font-weight:600; white-space:nowrap;
+    .btn-outline {
+      background:transparent; color:var(--foreground);
+      border-color:var(--border);
+    }
+    .btn-outline:hover { background:var(--muted); }
+    .btn-ghost {
+      background:transparent; color:var(--foreground);
+    }
+    .btn-ghost:hover { background:var(--muted); }
+    .btn-destructive {
+      background:color-mix(in srgb,var(--destructive) 10%,transparent);
+      color:var(--destructive);
+    }
+    .btn-destructive:hover {
+      background:color-mix(in srgb,var(--destructive) 20%,transparent);
+    }
+    .btn-xs { height:24px; padding:0 8px; font-size:11px; border-radius:10px; }
+    .btn-icon { width:28px; height:28px; padding:0; }
+    .btn-row { display:flex; gap:6px; align-items:center; }
+
+    .badge {
+      display:inline-flex; align-items:center; justify-content:center;
+      height:20px; padding:0 8px; border-radius:9999px;
+      font-size:11px; font-weight:500; white-space:nowrap;
+      border:1px solid transparent; line-height:1;
+    }
+    .badge-active {
       background:var(--vscode-inputValidation-infoBackground,#063b6d);
       color:var(--vscode-inputValidation-infoBorder,#3794ff);
-      border:1px solid var(--vscode-inputValidation-infoBorder,#3794ff);
+      border-color:var(--vscode-inputValidation-infoBorder,#3794ff);
     }
-    .srv-spacer { height:26px; }
-    .srv-default-badge {
-      font-size:10px; padding:1px 6px; border-radius:3px; cursor:pointer;
-      background:var(--vscode-badge-background,#4d4d4d);
-      color:var(--vscode-badge-foreground,#fff);
-      transition:opacity .15s; opacity:0; pointer-events:none;
+    .badge-outline {
+      background:transparent; color:var(--foreground);
+      border-color:var(--border);
     }
-    .srv-default-hover {
-      pointer-events:auto;
+    .badge-secondary {
+      background:var(--secondary); color:var(--secondary-foreground);
     }
-    .srv-row:hover .srv-default-hover {
-      opacity:1;
+
+    .input {
+      width:100%; height:32px; padding:4px 10px;
+      border-radius:8px; border:1px solid var(--input);
+      background:transparent; color:var(--foreground);
+      font-family:var(--vscode-font-family,sans-serif); font-size:13px;
+      transition:border-color .15s,box-shadow .15s;
+      outline:none; min-width:0; display:block;
     }
-    .srv-default-visible {
-      opacity:1; pointer-events:none;
+    .input:focus {
+      border-color:var(--ring);
+      box-shadow:0 0 0 3px color-mix(in srgb,var(--ring) 50%,transparent);
     }
-    .srv-fields {
-      display:flex; flex-direction:column; gap:4px; min-width:0;
+    .input::placeholder { color:var(--muted-foreground); opacity:1; }
+    .input-sm { height:28px; padding:2px 8px; font-size:12px; border-radius:6px; }
+    .input-title {
+      width:100%; font-size:13px; font-weight:500; line-height:1.3;
+      background:transparent; border:none; color:var(--card-foreground);
+      font-family:var(--vscode-font-family,sans-serif); outline:none; padding:0; margin:0;
     }
-    .srv-field-row {
-      display:flex; gap:4px;
-    }
-    .srv-url {
-      width:100%; padding:4px 6px; border:1px solid var(--vscode-input-border,#3c3c3c); border-radius:2px;
-      background:var(--vscode-input-background,#3c3c3c); color:var(--vscode-input-foreground,#ccc);
-      font-family:var(--vscode-font-family,sans-serif); font-size:12px;
-    }
-    .srv-user, .srv-pass {
-      flex:1; min-width:0; padding:4px 6px; border:1px solid var(--vscode-input-border,#3c3c3c); border-radius:2px;
-      background:var(--vscode-input-background,#3c3c3c); color:var(--vscode-input-foreground,#ccc);
-      font-family:var(--vscode-font-family,sans-serif); font-size:12px;
-    }
-    .srv-toggle-row {
+    .input-title::placeholder { color:var(--muted-foreground); opacity:.5; }
+    .field-row { display:flex; gap:4px; }
+    .field-row > .input { flex:1; min-width:0; }
+
+    .toggle-row {
       display:flex; align-items:center; gap:12px; flex-wrap:wrap;
     }
-    .srv-toggle {
-      display:flex; align-items:center; gap:4px; cursor:pointer; font-size:11px; padding:2px 0;
+    .switch-label {
+      display:inline-flex; align-items:center; gap:6px;
+      cursor:pointer; font-size:11px; user-select:none;
     }
-    .srv-toggle input { cursor:pointer; }
-    .srv-remove {
-      display:flex; align-items:center; justify-content:center; min-width:24px;
+    .switch-input {
+      appearance:none; -webkit-appearance:none;
+      width:32px; height:18.4px; border-radius:9999px;
+      background:var(--input); cursor:pointer; transition:background .2s;
+      flex-shrink:0; position:relative; border:1px solid transparent; margin:0;
     }
-    .srv-remove svg:hover { opacity:1 !important; }
+    .switch-input::after {
+      content:''; position:absolute; top:1.2px; left:1.2px;
+      width:14px; height:14px; border-radius:50%;
+      background:var(--card-foreground); transition:transform .2s;
+    }
+    .switch-input:checked { background:var(--primary); }
+    .switch-input:checked::after { transform:translateX(13.6px); }
 
-    .local-server-section {
+    .status-dot {
+      display:inline-block; width:10px; height:10px; border-radius:50%;
+      flex-shrink:0; background:var(--muted);
+    }
+    .status-dot.connected { background:#4ec94e; }
+    .status-dot.disconnected { background:var(--destructive); }
+    .status-dot.auth { background:var(--muted-foreground); }
+    .status-dot.muted { background:var(--muted); opacity:.5; }
+    .status-dot.pulse { animation:pulse 1.5s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+
+    .local-section {
       margin-top:16px; padding-top:12px;
-      border-top:1px solid var(--vscode-sideBar-border,#3c3c3c);
+      border-top:1px solid var(--border);
     }
     .section-title {
       text-align:center; font-size:12px; font-weight:600; text-transform:uppercase;
-      color:var(--vscode-descriptionForeground,#999); margin-bottom:10px;
-      letter-spacing:.5px;
+      color:var(--muted-foreground); margin-bottom:8px; letter-spacing:.5px;
     }
   </style>
 </head>
@@ -1331,10 +1558,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         document.getElementById('overlay').className = 'overlay' + (msg.overlayHidden ? ' hidden' : '');
         const iframe = document.getElementById('ocFrame');
         if (iframe) {
-          iframe.style.display = msg.showIframe ? 'block' : 'none';
-          if (msg.iframeUrl && (!iframe.src || iframe.src === '' || iframe.src === 'about:blank')) {
+          if (msg.showIframe && msg.iframeUrl && iframe.src !== msg.iframeUrl) {
             iframe.src = msg.iframeUrl;
           }
+          iframe.style.display = msg.showIframe ? 'block' : 'none';
         }
       }
     });
@@ -1382,18 +1609,16 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'startAndConnect', serverId });
     }
 
-    function updateServerConfig(serverId, key, value) {
-      vscode.postMessage({ type: 'updateServerConfig', serverId, key, value });
+    function pendingChange(serverId, key, value) {
+      vscode.postMessage({ type: 'pendingChange', serverId, key, value });
     }
 
-    function saveCredentials(serverId, password) {
-      vscode.postMessage({ type: 'saveCredentials', serverId, password });
+    function commitServerChanges(serverId) {
+      vscode.postMessage({ type: 'commitServerChanges', serverId });
     }
 
     function removeServer(serverId) {
-      if (confirm('Remove this server?')) {
-        vscode.postMessage({ type: 'removeServer', serverId });
-      }
+      vscode.postMessage({ type: 'removeServer', serverId });
     }
 
     function setDefaultServer(serverId) {
@@ -1401,7 +1626,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
 
     function addServer() {
-      vscode.postMessage({ type: 'addServer', config: { url: 'http://', label: '' } });
+      vscode.postMessage({ type: 'addServer', config: { url: 'http://localhost:4096', label: '' } });
     }
 
     function claimFocus() {
@@ -1452,14 +1677,18 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const regularHtml = regularServers.map(s => this.renderServerRow(s, false)).join('\n');
     const localHtml = localServer ? this.renderServerRow(localServer, true) : '';
 
+    const regularSection = regularHtml || regularServers.length > 0
+      ? `<div class="section-title" style="margin-top:8px">Servers</div>${regularHtml}` : '';
+
     return `<div class="server-selector">
-      ${regularHtml}
-      <div class="local-server-section">
+      <button class="btn btn-ghost btn-xs" onclick="selectServer()" style="margin-bottom:4px;flex-shrink:0">&larr; Back</button>
+      ${regularSection}
+      <div class="local-section">
         <div class="section-title">Local Server</div>
-        ${localHtml || '<span style="font-size:12px;opacity:.7">No local server configured</span>'}
+        ${localHtml || '<span style="font-size:12px;opacity:.5">No local server configured</span>'}
       </div>
-      <div class="btn-row">
-        <button onclick="addServer()">+ Add Server</button>
+      <div class="btn-row" style="justify-content:center;margin-top:4px">
+        <button class="btn btn-outline" style="height:32px;padding:0 16px;border-radius:8px" onclick="addServer()">+ Add Server</button>
       </div>
     </div>`;
   }
