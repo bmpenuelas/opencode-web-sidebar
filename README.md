@@ -16,7 +16,7 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 - 🔑 **Password support** — credentials stored securely in your OS keychain via VS Code SecretStorage
 - 🔐 **Env var fallback** — reads `OPENCODE_SERVER_PASSWORD` if no password is stored
 - 📁 **Open files** — open files in VS Code directly from the webview
-- 🌐 **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding
+- 🌐 **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding and prevents losing the cursor focus while typing in files
 - 🔗 **Remote SSH** — works with [VSCode Remote SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) via automatic port forwarding
 
 ## ❗ Important: requirements

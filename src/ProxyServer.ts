@@ -17,7 +17,7 @@ const STATE_FILE = path.join(STATE_DIR, 'proxy-state.json');
 
 const PORT_MIN = 4097;
 const PORT_MAX = 5002;
-const PROXY_FEATURE_KEY = 'web-sidebar-injection-v1';
+const PROXY_FEATURE_KEY = 'web-sidebar-injection-v2';
 
 interface ProxyEntry {
   port: number;
@@ -102,6 +102,16 @@ function getHttpModule(protocol: string): typeof http | typeof https {
 
 const WEBSIDEBAR_FOCUS_GUARD_SCRIPT = `<script>
 (function(){
+  function installSiteTweaks(){
+    if(document.getElementById('oc-web-sidebar-site-tweaks'))return;
+    var style=document.createElement('style');
+    style.id='oc-web-sidebar-site-tweaks';
+    style.textContent='div[data-slot="tabs-trigger-wrapper"][data-value="servers"],[data-slot="tabs-trigger-wrapper"][data-value="servers"],[role="tab"][data-value="servers"],button[data-value="servers"],div[id$="-content-servers"],[role="tabpanel"][data-value="servers"],[data-slot="tabs-content"][data-value="servers"]{display:none!important}';
+    (document.head||document.documentElement).appendChild(style);
+  }
+
+  installSiteTweaks();
+
   if(window.__ocWebSidebarFocusGuard)return;
   window.__ocWebSidebarFocusGuard=true;
 
@@ -138,7 +148,7 @@ const WEBSIDEBAR_FOCUS_GUARD_SCRIPT = `<script>
 
   removeAutofocus(document);
   if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded',function(){removeAutofocus(document)});
+    document.addEventListener('DOMContentLoaded',function(){installSiteTweaks();removeAutofocus(document)});
   }
 
   new MutationObserver(function(records){
