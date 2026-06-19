@@ -548,11 +548,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             await this.commitPendingChanges(msg.serverId);
           }
           break;
-        case 'refocusEditor':
-          setTimeout(() => {
-            vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup');
-          }, 50);
-          break;
       }
     });
 
@@ -1688,7 +1683,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     <a onclick="closePanel()">Close</a>
   </div>
 
-  <iframe id="ocFrame" tabindex="-1" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+  <iframe id="ocFrame" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
     ${iframeSrc}></iframe>
 
   <div id="overlay" class="overlay ${overlayHidden ? 'hidden' : ''}">
@@ -1697,48 +1692,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   <script>
     const vscode = acquireVsCodeApi();
-    let iframeFocusAllowedUntil = 0;
-    const iframeFocusIntentWindowMs = 5000;
-
-    function guardIframeFocus() {
-      const iframe = document.getElementById('ocFrame');
-      if (!iframe || document.activeElement !== iframe) {
-        return;
-      }
-      if (Date.now() > iframeFocusAllowedUntil) {
-        iframe.blur();
-        vscode.postMessage({ type: 'refocusEditor' });
-      }
-    }
-
-    setInterval(() => {
-      const iframe = document.getElementById('ocFrame');
-      if (iframe && document.activeElement === iframe && Date.now() > iframeFocusAllowedUntil) {
-        iframe.blur();
-        vscode.postMessage({ type: 'refocusEditor' });
-      }
-    }, 100);
-
-    document.addEventListener('mousedown', (e) => {
-      const iframe = document.getElementById('ocFrame');
-      if (!iframe) return;
-      if (e.target === iframe || iframe.contains(e.target)) {
-        iframeFocusAllowedUntil = Date.now() + iframeFocusIntentWindowMs;
-        return;
-      }
-      if (document.activeElement === iframe) {
-        iframe.blur();
-        vscode.postMessage({ type: 'refocusEditor' });
-      }
-    }, true);
-
-    document.addEventListener('focusin', () => {
-      [0, 25, 50].forEach(delay => setTimeout(guardIframeFocus, delay));
-    });
-
-    window.addEventListener('blur', () => {
-      [0, 25, 100, 250].forEach(delay => setTimeout(guardIframeFocus, delay));
-    });
 
     window.addEventListener('message', event => {
       const msg = event.data;
@@ -1751,14 +1704,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         const iframe = document.getElementById('ocFrame');
         if (iframe) {
           if (msg.showIframe && msg.iframeUrl && iframe.src !== msg.iframeUrl) {
-            iframeFocusAllowedUntil = 0;
             iframe.src = msg.iframeUrl;
           } else if (!msg.showIframe) {
-            iframeFocusAllowedUntil = 0;
             iframe.removeAttribute('src');
           }
           iframe.style.display = msg.showIframe ? 'block' : 'none';
-          guardIframeFocus();
         }
       }
     });
@@ -1825,7 +1775,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     function sendWorkspace() {
       const iframe = document.getElementById('ocFrame');
-      iframeFocusAllowedUntil = 0;
       const folder = ${JSON.stringify(this.getWorkspaceFolder())};
       if (iframe && iframe.contentWindow && folder) {
         const origin = iframe.src ? new URL(iframe.src).origin : '*';
@@ -1834,7 +1783,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           { type: 'openProject', path: folder, dir: b64, source: 'vscode' }, origin
         );
       }
-      [0, 50, 150, 400, 1000].forEach(delay => setTimeout(guardIframeFocus, delay));
     }
 
     function syncTheme() {

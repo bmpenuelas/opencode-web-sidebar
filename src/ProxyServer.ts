@@ -17,6 +17,7 @@ const STATE_FILE = path.join(STATE_DIR, 'proxy-state.json');
 
 const PORT_MIN = 4097;
 const PORT_MAX = 5002;
+const PROXY_FEATURE_KEY = 'web-sidebar-injection-v1';
 
 interface ProxyEntry {
   port: number;
@@ -99,6 +100,139 @@ function getHttpModule(protocol: string): typeof http | typeof https {
   return protocol === 'https:' ? https : http;
 }
 
+const WEBSIDEBAR_FOCUS_GUARD_SCRIPT = `<script>
+(function(){
+  if(window.__ocWebSidebarFocusGuard)return;
+  window.__ocWebSidebarFocusGuard=true;
+
+  var allowProgrammaticFocusUntil=0;
+  var focusIntentWindowMs=6000;
+  var nativeFocus=HTMLElement.prototype.focus;
+
+  function markUserIntent(){
+    allowProgrammaticFocusUntil=Date.now()+focusIntentWindowMs;
+  }
+
+  ['pointerdown','mousedown','touchstart','keydown'].forEach(function(type){
+    document.addEventListener(type,function(event){
+      if(event.isTrusted!==false)markUserIntent();
+    },true);
+  });
+
+  function canProgrammaticallyFocus(){
+    return Date.now()<=allowProgrammaticFocusUntil;
+  }
+
+  HTMLElement.prototype.focus=function(options){
+    if(!canProgrammaticallyFocus()){
+      return;
+    }
+    return nativeFocus.call(this,options);
+  };
+
+  function removeAutofocus(root){
+    if(!root||!root.querySelectorAll)return;
+    if(root.hasAttribute&&root.hasAttribute('autofocus'))root.removeAttribute('autofocus');
+    root.querySelectorAll('[autofocus]').forEach(function(el){el.removeAttribute('autofocus')});
+  }
+
+  removeAutofocus(document);
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',function(){removeAutofocus(document)});
+  }
+
+  new MutationObserver(function(records){
+    records.forEach(function(record){
+      if(record.type==='attributes'&&record.target&&record.target.removeAttribute){
+        record.target.removeAttribute('autofocus');
+      }
+      record.addedNodes&&record.addedNodes.forEach(function(node){removeAutofocus(node)});
+    });
+  }).observe(document.documentElement||document,{subtree:true,childList:true,attributes:true,attributeFilter:['autofocus']});
+})();
+</script>`;
+
+function shouldInjectScript(req: http.IncomingMessage, proxyRes: http.IncomingMessage): boolean {
+  if (req.method === 'HEAD') {
+    return false;
+  }
+  const statusCode = proxyRes.statusCode || 200;
+  if (statusCode < 200 || statusCode >= 300) {
+    return false;
+  }
+  if (statusCode === 204 || statusCode === 205) {
+    return false;
+  }
+
+  const encoding = proxyRes.headers['content-encoding'];
+  if (encoding) {
+    return false;
+  }
+
+  const contentType = proxyRes.headers['content-type'];
+  const contentTypeValue = Array.isArray(contentType) ? contentType.join(';') : contentType || '';
+  return /\btext\/html\b/i.test(contentTypeValue);
+}
+
+function injectWebSidebarScript(html: string): string {
+  if (html.includes('__ocWebSidebarFocusGuard')) {
+    return html;
+  }
+
+  const headMatch = /<head\b[^>]*>/i.exec(html);
+  if (headMatch?.index !== undefined) {
+    const insertAt = headMatch.index + headMatch[0].length;
+    return html.slice(0, insertAt) + WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html.slice(insertAt);
+  }
+
+  const scriptMatch = /<script\b/i.exec(html);
+  if (scriptMatch?.index !== undefined) {
+    return html.slice(0, scriptMatch.index) + WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html.slice(scriptMatch.index);
+  }
+
+  return WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html;
+}
+
+function sendInjectedHtml(
+  proxyRes: http.IncomingMessage,
+  res: http.ServerResponse,
+  resHeaders: Record<string, string | string[]>,
+): void {
+  const chunks: Buffer[] = [];
+
+  proxyRes.on('data', chunk => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+
+  proxyRes.on('end', () => {
+    if (res.destroyed) {
+      return;
+    }
+
+    const html = Buffer.concat(chunks).toString('utf8');
+    const injected = injectWebSidebarScript(html);
+    const body = Buffer.from(injected, 'utf8');
+
+    delete resHeaders['content-length'];
+    delete resHeaders['Content-Length'];
+    delete resHeaders['transfer-encoding'];
+    delete resHeaders['Transfer-Encoding'];
+    delete resHeaders['etag'];
+    delete resHeaders['ETag'];
+    resHeaders['content-length'] = String(body.byteLength);
+
+    res.writeHead(proxyRes.statusCode || 200, resHeaders);
+    res.end(body);
+  });
+
+  proxyRes.on('error', err => {
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'text/plain' });
+      res.end(`Bad Gateway: ${err.message}`);
+    }
+  });
+}
+
 function createRequestHandler(targetUrl: string, auth: string | null): http.RequestListener {
   const parsed = new URL(targetUrl);
   const targetHost = parsed.host;
@@ -111,6 +245,7 @@ function createRequestHandler(targetUrl: string, auth: string | null): http.Requ
 
     const headers = copyHeaders(req.headers);
     headers['host'] = targetHost;
+    delete headers['accept-encoding'];
     if (auth) {
       headers['authorization'] = auth;
     }
@@ -139,8 +274,12 @@ function createRequestHandler(targetUrl: string, auth: string | null): http.Requ
 
     proxyReq.on('response', (proxyRes) => {
       const resHeaders = filteredHeaders(proxyRes.headers);
-      res.writeHead(proxyRes.statusCode || 200, resHeaders);
-      proxyRes.pipe(res);
+      if (shouldInjectScript(req, proxyRes)) {
+        sendInjectedHtml(proxyRes, res, resHeaders);
+      } else {
+        res.writeHead(proxyRes.statusCode || 200, resHeaders);
+        proxyRes.pipe(res);
+      }
     });
 
     req.pipe(proxyReq);
@@ -253,7 +392,7 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
     ? `Basic ${Buffer.from(`${parsed.username}:${parsed.password}`).toString('base64')}`
     : null;
   const authKey = auth ? crypto.createHash('sha256').update(auth).digest('hex') : 'none';
-  const key = `${parsed.protocol}//${parsed.host}|auth=${authKey}`;
+  const key = `${parsed.protocol}//${parsed.host}|auth=${authKey}|features=${PROXY_FEATURE_KEY}`;
 
   const handler = createRequestHandler(targetUrl, auth);
   const upgradeHandler = createUpgradeHandler(targetUrl, auth);
