@@ -1,7 +1,10 @@
 import * as http from 'http';
+import * as https from 'https';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
+import type * as net from 'net';
 
 const BLOCKED_HEADERS = new Set([
   'content-security-policy',
@@ -72,27 +75,47 @@ async function testProxyAlive(port: number): Promise<boolean> {
   }
 }
 
+function copyHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === 'string') {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function filteredHeaders(headers: http.IncomingHttpHeaders): Record<string, string | string[]> {
+  const result: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!BLOCKED_HEADERS.has(key.toLowerCase()) && value !== undefined) {
+      result[key] = value as string | string[];
+    }
+  }
+  return result;
+}
+
+function getHttpModule(protocol: string): typeof http | typeof https {
+  return protocol === 'https:' ? https : http;
+}
+
 function createRequestHandler(targetUrl: string, auth: string | null): http.RequestListener {
   const parsed = new URL(targetUrl);
   const targetHost = parsed.host;
   const connectHost = targetHost.replace(/^localhost:/i, '127.0.0.1:');
-  const baseUrl = `http://${connectHost}`;
+  const baseUrl = `${parsed.protocol}//${connectHost}`;
+  const httpModule = getHttpModule(parsed.protocol);
 
   return (req, res) => {
     const target = baseUrl + (req.url || '/');
 
-    const headers: Record<string, string> = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === 'string') {
-        headers[key] = value;
-      }
-    }
+    const headers = copyHeaders(req.headers);
     headers['host'] = targetHost;
     if (auth) {
       headers['authorization'] = auth;
     }
 
-    const proxyReq = http.request(target, {
+    const proxyReq = httpModule.request(target, {
       method: req.method,
       headers,
       timeout: 10000,
@@ -115,34 +138,94 @@ function createRequestHandler(targetUrl: string, auth: string | null): http.Requ
     });
 
     proxyReq.on('response', (proxyRes) => {
-      const resHeaders: Record<string, string | string[]> = {};
-      for (const [key, value] of Object.entries(proxyRes.headers)) {
-        if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
-          resHeaders[key] = value as string | string[];
-        }
-      }
+      const resHeaders = filteredHeaders(proxyRes.headers);
       res.writeHead(proxyRes.statusCode || 200, resHeaders);
       proxyRes.pipe(res);
-    });
-
-    proxyReq.on('upgrade', (proxyRes, socket) => {
-      const resHeaders: Record<string, string | string[]> = {};
-      for (const [key, value] of Object.entries(proxyRes.headers)) {
-        if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
-          resHeaders[key] = value as string | string[];
-        }
-      }
-      res.writeHead(101, resHeaders);
-      socket.pipe(res);
-      res.pipe(socket);
     });
 
     req.pipe(proxyReq);
   };
 }
 
-async function tryBind(port: number, handler: http.RequestListener): Promise<http.Server | null> {
+function createUpgradeHandler(
+  targetUrl: string,
+  auth: string | null,
+): (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => void {
+  const parsed = new URL(targetUrl);
+  const targetHost = parsed.host;
+  const connectHost = targetHost.replace(/^localhost:/i, '127.0.0.1:');
+  const httpModule = getHttpModule(parsed.protocol);
+
+  return (req, socket, head) => {
+    const target = `${parsed.protocol}//${connectHost}${req.url || '/'}`;
+    const headers = copyHeaders(req.headers);
+    headers['host'] = targetHost;
+    if (auth) {
+      headers['authorization'] = auth;
+    }
+
+    const proxyReq = httpModule.request(target, {
+      method: req.method,
+      headers,
+      timeout: 10000,
+      agent: false,
+    });
+
+    proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+      const resHeaders = filteredHeaders(proxyRes.headers);
+      const headerLines = Object.entries(resHeaders).flatMap(([key, value]) =>
+        Array.isArray(value)
+          ? value.map(v => `${key}: ${v}`)
+          : [`${key}: ${value}`]
+      );
+      socket.write([
+        `HTTP/${proxyRes.httpVersion} ${proxyRes.statusCode || 101} ${proxyRes.statusMessage || 'Switching Protocols'}`,
+        ...headerLines,
+        '',
+        '',
+      ].join('\r\n'));
+      if (proxyHead.length > 0) {
+        socket.write(proxyHead);
+      }
+      if (head.length > 0) {
+        proxySocket.write(head);
+      }
+      proxySocket.pipe(socket);
+      socket.pipe(proxySocket);
+    });
+
+    proxyReq.on('response', (proxyRes) => {
+      socket.write(`HTTP/${proxyRes.httpVersion} ${proxyRes.statusCode || 502} ${proxyRes.statusMessage || 'Bad Gateway'}\r\n\r\n`);
+      socket.destroy();
+      proxyRes.resume();
+    });
+
+    proxyReq.on('error', (err) => {
+      if (!socket.destroyed) {
+        socket.write(`HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\n\r\nBad Gateway: ${err.message}`);
+        socket.destroy();
+      }
+    });
+
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy();
+      if (!socket.destroyed) {
+        socket.write('HTTP/1.1 504 Gateway Timeout\r\ncontent-type: text/plain\r\n\r\nGateway Timeout');
+        socket.destroy();
+      }
+    });
+
+    proxyReq.end();
+  };
+}
+
+async function tryBind(
+  port: number,
+  handler: http.RequestListener,
+  upgradeHandler: (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => void,
+): Promise<http.Server | null> {
   const server = http.createServer(handler);
+  server.on('upgrade', upgradeHandler);
   try {
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
@@ -166,12 +249,14 @@ interface SharedProxyHandle {
 
 export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHandle> {
   const parsed = new URL(targetUrl);
-  const key = `${parsed.protocol}//${parsed.host}`;
   const auth = parsed.username
     ? `Basic ${Buffer.from(`${parsed.username}:${parsed.password}`).toString('base64')}`
     : null;
+  const authKey = auth ? crypto.createHash('sha256').update(auth).digest('hex') : 'none';
+  const key = `${parsed.protocol}//${parsed.host}|auth=${authKey}`;
 
   const handler = createRequestHandler(targetUrl, auth);
+  const upgradeHandler = createUpgradeHandler(targetUrl, auth);
 
   const state = readState();
   cleanStalePids(state);
@@ -216,7 +301,7 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
 
   for (let port = PORT_MIN; port <= PORT_MAX; port++) {
     if (usedPorts.has(port)) continue;
-    server = await tryBind(port, handler);
+    server = await tryBind(port, handler, upgradeHandler);
     if (server) {
       state.proxies[key] = { port, ownerPid: process.pid, clientPids: [process.pid] };
       writeState(state);
@@ -241,7 +326,7 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
     }
   }
 
-  server = await tryBind(0, handler);
+  server = await tryBind(0, handler, upgradeHandler);
   if (!server) throw new Error('Failed to bind proxy to any port');
 
   const addr = server.address();

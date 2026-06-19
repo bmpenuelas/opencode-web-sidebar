@@ -2,8 +2,42 @@ import * as vscode from 'vscode';
 import { spawn, type ChildProcess } from 'child_process';
 import { getOrCreateProxy } from './ProxyServer';
 
+const HEALTH_CHECK_TIMEOUT_MS = 3000;
+const PROXY_START_TIMEOUT_MS = 4000;
+const CONNECTION_RECHECK_TIMEOUT_MS = 6000;
+
 function escapeAttr(text: string): string {
-  return text.replace(/"/g, '&quot;');
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeJsString(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 type ConnectionState = 'checking' | 'disconnected' | 'auth-required' | 'connected' | 'starting';
@@ -40,6 +74,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _pendingChanges = new Map<string, Record<string, any>>();
   private _serverStatuses = new Map<string, ConnectionState | 'unknown'>();
   private _allServersPollTimer: ReturnType<typeof setInterval> | undefined;
+  private _pollInFlight: Promise<void> | undefined;
+  private _proxyOperationId = 0;
   private _proxyPort: number | undefined;
   private _proxyDispose: (() => Promise<void>) | undefined;
   private _proxyBaseUrl: string | undefined;
@@ -276,8 +312,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this.render();
     }
 
-    await this.startProxy();
+    const proxyReady = await this.startProxy();
     if (gen !== this._serverGeneration) return;
+    if (!proxyReady) {
+      this._connectionState = 'disconnected';
+      this.updateStatusBar();
+      this.sendStateUpdate();
+      return;
+    }
     await this.pollOnce();
   }
 
@@ -300,9 +342,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         this._connectionState = 'checking';
         this.updateStatusBar();
         this.render();
-        await this.startProxy();
+        const proxyReady = await this.startProxy();
         if (gen === this._serverGeneration) {
-          await this.pollOnce();
+          if (proxyReady) {
+            await this.pollOnce();
+          } else {
+            this._connectionState = 'disconnected';
+            this.updateStatusBar();
+            this.sendStateUpdate();
+          }
         }
       } else {
         this.sendStateUpdate();
@@ -399,7 +447,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('opencode-web-sidebar.setPassword');
           break;
         case 'refresh':
-          this.render();
+          await this.recheckConnection({ showChecking: true, reloadIframe: true });
           break;
         case 'startServer':
           this.startServer();
@@ -445,9 +493,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             this._connectionState = 'checking';
             this.updateStatusBar();
             this.render();
-            await this.startProxy();
+            const proxyReady = await this.startProxy();
             if (gen !== this._serverGeneration) break;
-            const state = await this.checkHealth();
+            const state = proxyReady ? await this.checkHealth() : 'disconnected';
             if (gen !== this._serverGeneration) break;
             if (state === 'connected' || state === 'auth-required') {
               this._connectionState = state;
@@ -500,6 +548,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             await this.commitPendingChanges(msg.serverId);
           }
           break;
+        case 'refocusEditor':
+          setTimeout(() => {
+            vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup');
+          }, 50);
+          break;
       }
     });
 
@@ -519,16 +572,20 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._isVisible = webviewView.visible;
       this.log(`Visibility changed: ${this._isVisible}`);
       if (this._isVisible) {
-        this.startPolling();
+        this._view = webviewView;
+        void this.recheckConnection({ showChecking: false });
       } else {
         this.stopPolling();
       }
     });
 
     await this.loadServers();
-    await this.startProxy();
-    this.startPolling();
+    this._connectionState = 'checking';
+    this._isReconnecting = false;
+    this.updateStatusBar();
     this.render();
+    await this.recheckConnection({ showChecking: false });
+    this.startPolling();
   }
 
   async show(): Promise<void> {
@@ -538,7 +595,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   async close(): Promise<void> {
     this._isVisible = false;
-    this._view = undefined;
     this.stopPolling();
     try {
       await vscode.commands.executeCommand('workbench.action.toggleAuxiliaryBar');
@@ -553,17 +609,63 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this.log('Rendered webview HTML');
   }
 
+  private async recheckConnection(options: { showChecking?: boolean; reloadIframe?: boolean } = {}): Promise<void> {
+    const { showChecking = true, reloadIframe = false } = options;
+    const gen = ++this._serverGeneration;
+
+    this._isReconnecting = false;
+    this._reconnectAttempts = 0;
+    this._consecutiveHealthFailures = 0;
+    this._consecutiveAuthRequired = 0;
+    this.clearReconnectTimer();
+
+    if (showChecking) {
+      this._connectionState = 'checking';
+      this.updateStatusBar();
+      this.sendStateUpdate();
+    }
+
+    let state: ConnectionState = 'disconnected';
+    try {
+      state = await withTimeout((async () => {
+        const proxyReady = await this.startProxy();
+        if (!proxyReady) {
+          return 'disconnected';
+        }
+        return await this.checkHealth();
+      })(), CONNECTION_RECHECK_TIMEOUT_MS, 'connection recheck');
+    } catch (err) {
+      this.log(`Connection recheck failed: ${err}`);
+      state = 'disconnected';
+    }
+
+    if (this._disposed || gen !== this._serverGeneration) {
+      return;
+    }
+
+    this._connectionState = state;
+    this._isReconnecting = false;
+    this.updateStatusBar();
+
+    if (reloadIframe && state === 'connected') {
+      this.render();
+    } else {
+      this.sendStateUpdate();
+    }
+
+    if (state === 'disconnected') {
+      this.scheduleReconnect();
+    }
+
+    if (this._isVisible) {
+      this.startPolling();
+    }
+  }
+
   async onUrlChanged(): Promise<void> {
     this.log('Config changed, reloading servers');
     await this.loadServers();
-    this._connectionState = 'checking';
-    this._isReconnecting = false;
-    this._reconnectAttempts = 0;
-    this.clearReconnectTimer();
-    this.updateStatusBar();
-    this.render();
-    await this.startProxy();
-    await this.pollOnce();
+    await this.recheckConnection({ showChecking: true });
   }
 
   dispose(): void {
@@ -723,12 +825,13 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     });
   }
 
-  private async startProxy(): Promise<void> {
-    await this.stopProxy();
+  private async startProxy(): Promise<boolean> {
+    const opId = ++this._proxyOperationId;
+    await this.stopProxy(false);
     const url = this.getConfiguredUrl();
     if (!url) {
       this.log('No URL configured, skipping proxy');
-      return;
+      return false;
     }
     try {
       const parsed = new URL(url);
@@ -738,13 +841,19 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
       const targetUrl = parsed.toString();
       this.log(`Starting proxy for ${parsed.host}${this._cachedPassword ? ' (with auth)' : ' (no auth)'}`);
-      const handle = await getOrCreateProxy(targetUrl);
+      const handle = await withTimeout(getOrCreateProxy(targetUrl), PROXY_START_TIMEOUT_MS, 'proxy startup');
+      if (opId !== this._proxyOperationId || this._disposed) {
+        await handle.dispose();
+        return false;
+      }
       this._proxyPort = handle.port;
       this._proxyDispose = handle.dispose;
       this.log(`Proxy listening on port ${this._proxyPort}`);
-      this._proxyBaseUrl = await this.resolveProxyBaseUrl();
+      this._proxyBaseUrl = await withTimeout(this.resolveProxyBaseUrl(), PROXY_START_TIMEOUT_MS, 'proxy URI resolution');
+      return true;
     } catch (err) {
       this.log(`Failed to start proxy: ${err}`);
+      return false;
     }
   }
 
@@ -763,7 +872,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     return undefined;
   }
 
-  private async stopProxy(): Promise<void> {
+  private async stopProxy(invalidateInFlight = true): Promise<void> {
+    if (invalidateInFlight) {
+      this._proxyOperationId++;
+    }
     if (this._proxyDispose) {
       this.log('Stopping proxy');
       await this._proxyDispose();
@@ -785,6 +897,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     const state = await this.checkHealth();
     if (state === 'connected' || state === 'auth-required') {
+      if (state === 'connected' && !this._proxyPort && !this._proxyBaseUrl) {
+        const proxyReady = await this.startProxy();
+        if (!proxyReady) {
+          this._connectionState = 'disconnected';
+          this.updateStatusBar();
+          this.sendStateUpdate();
+          return;
+        }
+      }
       this._connectionState = state;
       this._startedByUs = false;
       vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
@@ -972,7 +1093,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     try {
       const resp = await fetch(url, {
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
         method: 'HEAD',
       });
       this.log(`Health check (no auth): ${resp.status}`);
@@ -983,7 +1104,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         try {
           const authResp = await fetch(url, {
             method: 'HEAD',
-            signal: AbortSignal.timeout(3000),
+            signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
             headers: { 'Authorization': `Basic ${encoded}` },
           });
           this.log(`Health check (with auth): ${authResp.status}`);
@@ -1027,13 +1148,36 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   }
 
   private async pollOnce(): Promise<void> {
+    if (this._pollInFlight) {
+      return this._pollInFlight;
+    }
+    this._pollInFlight = this.doPollOnce().finally(() => {
+      this._pollInFlight = undefined;
+    });
+    return this._pollInFlight;
+  }
+
+  private async doPollOnce(): Promise<void> {
     const gen = this._serverGeneration;
     if (this._disposed) { return; }
     const state = await this.checkHealth();
     if (gen !== this._serverGeneration) { return; }
-    if (state === this._connectionState && !this._isReconnecting) { return; }
+    if (
+      state === this._connectionState &&
+      !this._isReconnecting &&
+      !(state === 'connected' && !this._proxyPort && !this._proxyBaseUrl)
+    ) { return; }
 
     if (state === 'connected') {
+      if (!this._proxyPort && !this._proxyBaseUrl) {
+        const proxyReady = await this.startProxy();
+        if (gen !== this._serverGeneration || !proxyReady) {
+          this._connectionState = 'disconnected';
+          this.updateStatusBar();
+          this.sendStateUpdate();
+          return;
+        }
+      }
       this._consecutiveAuthRequired = 0;
       if (this._connectionState !== 'connected') {
         this.stopPolling();
@@ -1139,6 +1283,13 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       const state = await this.checkHealth();
       if (gen !== this._serverGeneration) { return; }
       if (state === 'connected' || state === 'auth-required') {
+        if (state === 'connected' && !this._proxyPort && !this._proxyBaseUrl) {
+          const proxyReady = await this.startProxy();
+          if (gen !== this._serverGeneration || !proxyReady) {
+            this.scheduleReconnect();
+            return;
+          }
+        }
         this._isReconnecting = false;
         this._connectionState = state;
         this._reconnectAttempts = 0;
@@ -1155,10 +1306,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const isActive = server.id === activeId;
     const pending = this._pendingChanges.get(server.id);
     const hasPending = !!pending;
+    const serverIdJs = escapeJsString(server.id);
+    const serverIdAttr = escapeAttr(server.id);
     const label = pending?.label ?? server.label ?? '';
     const url = pending?.url ?? server.url;
     const serverUsername = pending?.username ?? server.username ?? '';
-    const authEnabled = pending?.authEnabled ?? server.authEnabled ?? true;
+    const authEnabled = pending?.authEnabled ?? server.authEnabled ?? false;
     const isWsl = pending?.isWsl ?? server.isWsl ?? false;
     const hasPassword = !!(this._passwordsCache.get(server.id));
     const usingEnv = isActive && this._usingEnvPassword && !hasPassword;
@@ -1185,15 +1338,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         action = `<span class="badge badge-active">ACTIVE</span>`;
       } else {
         action = `<div class="btn-row">
-          <button class="btn btn-outline btn-xs" onclick="startAndConnect('${server.id}')">Start &amp; Connect</button>
-          <button class="btn btn-default btn-xs" onclick="connectToServer('${server.id}')">Connect</button>
+          <button class="btn btn-outline btn-xs" onclick="startAndConnect('${serverIdJs}')">Start &amp; Connect</button>
+          <button class="btn btn-default btn-xs" onclick="connectToServer('${serverIdJs}')">Connect</button>
         </div>`;
       }
     } else {
       if (isActive) {
         action = `<span class="badge badge-active">ACTIVE</span>`;
       } else {
-        action = `<button class="btn btn-default btn-xs" onclick="connectToServer('${server.id}')">Connect</button>`;
+        action = `<button class="btn btn-default btn-xs" onclick="connectToServer('${serverIdJs}')">Connect</button>`;
       }
     }
 
@@ -1201,41 +1354,41 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     if (isDefault) {
       footerLeft = `<span class="badge badge-outline">default</span>`;
     } else {
-      footerLeft = `<button class="btn btn-ghost btn-xs" onclick="setDefaultServer('${server.id}')">Set Default</button>`;
+      footerLeft = `<button class="btn btn-ghost btn-xs" onclick="setDefaultServer('${serverIdJs}')">Set Default</button>`;
     }
 
     const trashSvg = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="pointer-events:none;display:block"><path d="M6.5 1.5H5V3h6V1.5H9.5L9 1H7L6.5 1.5zM3 4v1h1v9.5c0 .3.2.5.5.5h7c.3 0 .5-.2.5-.5V5h1V4H3zm2 1h6v9H5V5z"/></svg>';
     const saveSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="pointer-events:none;display:block"><path fill-rule="evenodd" clip-rule="evenodd" d="M18.1716 1C18.702 1 19.2107 1.21071 19.5858 1.58579L22.4142 4.41421C22.7893 4.78929 23 5.29799 23 5.82843V20C23 21.6569 21.6569 23 20 23H4C2.34315 23 1 21.6569 1 20V4C1 2.34315 2.34315 1 4 1H18.1716ZM4 3C3.44772 3 3 3.44772 3 4V20C3 20.5523 3.44772 21 4 21L5 21L5 15C5 13.3431 6.34315 12 8 12L16 12C17.6569 12 19 13.3431 19 15V21H20C20.5523 21 21 20.5523 21 20V6.82843C21 6.29799 20.7893 5.78929 20.4142 5.41421L18.5858 3.58579C18.2107 3.21071 17.702 3 17.1716 3H17V5C17 6.65685 15.6569 8 14 8H10C8.34315 8 7 6.65685 7 5V3H4ZM17 21V15C17 14.4477 16.5523 14 16 14L8 14C7.44772 14 7 14.4477 7 15L7 21L17 21ZM9 3H15V5C15 5.55228 14.5523 6 14 6H10C9.44772 6 9 5.55228 9 5V3Z"/></svg>';
     const saveBtn = hasPending
-      ? `<span class="btn btn-default btn-xs" onclick="commitServerChanges('${server.id}')" title="Save changes" role="button" tabindex="0" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px">SAVE ${saveSvg}</span>`
+      ? `<span class="btn btn-default btn-xs" onclick="commitServerChanges('${serverIdJs}')" title="Save changes" role="button" tabindex="0" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px">SAVE ${saveSvg}</span>`
       : '';
 
     const userPlaceholder = (usingEnv && !server.username) ? '[Using opencode]' : 'Username';
     const passPlaceholder = usingEnv ? '[Using OPENCODE_SERVER_PASSWORD]' : hasPassword ? '••••••••' : 'Password';
     const authFieldsStyle = authEnabled ? '' : ' style="display:none"';
 
-    return `<div class="card" data-id="${server.id}">
+    return `<div class="card" data-id="${serverIdAttr}">
       <div class="card-header">
         <div class="card-title">
-          <input class="input-title" type="text" value="${escapeAttr(label)}" onchange="pendingChange('${server.id}','label',this.value)" placeholder="Server name" spellcheck="false">
+          <input class="input-title" type="text" value="${escapeAttr(label)}" onchange="pendingChange('${serverIdJs}','label',this.value)" placeholder="Server name" spellcheck="false">
           ${isActive ? `<span class="${statusClass}"></span>` : ''}
         </div>
         <div class="card-description">${urlValue}</div>
         <div class="card-action">${isActive ? action : `<span class="${statusClass}"></span> ${action}`}</div>
       </div>
       <div class="card-content">
-        <input class="input" type="text" value="${urlValue}" onchange="pendingChange('${server.id}','url',this.value)" placeholder="http://localhost:4096">
+        <input class="input" type="text" value="${urlValue}" onchange="pendingChange('${serverIdJs}','url',this.value)" placeholder="http://localhost:4096">
         <div class="field-row"${authFieldsStyle}>
-          <input class="input input-sm" id="user-${server.id}" type="text" placeholder="${userPlaceholder}" value="${escapeAttr(serverUsername)}" onchange="pendingChange('${server.id}','username',this.value)">
-          <input class="input input-sm" id="pass-${server.id}" type="password" placeholder="${passPlaceholder}" onchange="pendingChange('${server.id}','password',this.value)">
+          <input class="input input-sm" id="user-${serverIdAttr}" type="text" placeholder="${escapeAttr(userPlaceholder)}" value="${escapeAttr(serverUsername)}" onchange="pendingChange('${serverIdJs}','username',this.value)">
+          <input class="input input-sm" id="pass-${serverIdAttr}" type="password" placeholder="${escapeAttr(passPlaceholder)}" onchange="pendingChange('${serverIdJs}','password',this.value)">
         </div>
         <div class="toggle-row">
           <label class="switch-label">
-            <input type="checkbox" class="switch-input" ${authEnabled ? 'checked' : ''} onchange="pendingChange('${server.id}','authEnabled',this.checked)">
+            <input type="checkbox" class="switch-input" ${authEnabled ? 'checked' : ''} onchange="pendingChange('${serverIdJs}','authEnabled',this.checked)">
             <span>authentication</span>
           </label>
           <label class="switch-label">
-            <input type="checkbox" class="switch-input" ${isWsl ? 'checked' : ''} onchange="pendingChange('${server.id}','isWsl',this.checked)">
+            <input type="checkbox" class="switch-input" ${isWsl ? 'checked' : ''} onchange="pendingChange('${serverIdJs}','isWsl',this.checked)">
             <span>is WSL / Linux</span>
           </label>
         </div>
@@ -1244,7 +1397,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         ${footerLeft}
         <div style="flex:1"></div>
         ${saveBtn}
-        ${isLocal ? '' : `<span class="btn btn-ghost btn-xs" onclick="removeServer('${server.id}')" title="Remove server" role="button" tabindex="0" style="cursor:pointer">${trashSvg}</span>`}
+        ${isLocal ? '' : `<span class="btn btn-ghost btn-xs" onclick="removeServer('${serverIdJs}')" title="Remove server" role="button" tabindex="0" style="cursor:pointer">${trashSvg}</span>`}
       </div>
     </div>`;
   }
@@ -1285,7 +1438,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       "font-src 'self' data:;",
     ].join(' ');
 
-    const iframeSrc = iframeUrl
+    const iframeSrc = showIframe && iframeUrl
       ? `src="${escapeAttr(iframeUrl)}"` : '';
 
     this.log(`iframe URL: ${iframeUrl} (showIframe=${showIframe})`);
@@ -1535,7 +1688,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     <a onclick="closePanel()">Close</a>
   </div>
 
-  <iframe id="ocFrame" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+  <iframe id="ocFrame" tabindex="-1" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
     ${iframeSrc}></iframe>
 
   <div id="overlay" class="overlay ${overlayHidden ? 'hidden' : ''}">
@@ -1544,9 +1697,48 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   <script>
     const vscode = acquireVsCodeApi();
+    let iframeFocusAllowedUntil = 0;
+    const iframeFocusIntentWindowMs = 5000;
 
-    claimFocus();
-    [50, 150, 400, 1000].forEach(d => setTimeout(claimFocus, d));
+    function guardIframeFocus() {
+      const iframe = document.getElementById('ocFrame');
+      if (!iframe || document.activeElement !== iframe) {
+        return;
+      }
+      if (Date.now() > iframeFocusAllowedUntil) {
+        iframe.blur();
+        vscode.postMessage({ type: 'refocusEditor' });
+      }
+    }
+
+    setInterval(() => {
+      const iframe = document.getElementById('ocFrame');
+      if (iframe && document.activeElement === iframe && Date.now() > iframeFocusAllowedUntil) {
+        iframe.blur();
+        vscode.postMessage({ type: 'refocusEditor' });
+      }
+    }, 100);
+
+    document.addEventListener('mousedown', (e) => {
+      const iframe = document.getElementById('ocFrame');
+      if (!iframe) return;
+      if (e.target === iframe || iframe.contains(e.target)) {
+        iframeFocusAllowedUntil = Date.now() + iframeFocusIntentWindowMs;
+        return;
+      }
+      if (document.activeElement === iframe) {
+        iframe.blur();
+        vscode.postMessage({ type: 'refocusEditor' });
+      }
+    }, true);
+
+    document.addEventListener('focusin', () => {
+      [0, 25, 50].forEach(delay => setTimeout(guardIframeFocus, delay));
+    });
+
+    window.addEventListener('blur', () => {
+      [0, 25, 100, 250].forEach(delay => setTimeout(guardIframeFocus, delay));
+    });
 
     window.addEventListener('message', event => {
       const msg = event.data;
@@ -1559,9 +1751,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         const iframe = document.getElementById('ocFrame');
         if (iframe) {
           if (msg.showIframe && msg.iframeUrl && iframe.src !== msg.iframeUrl) {
+            iframeFocusAllowedUntil = 0;
             iframe.src = msg.iframeUrl;
+          } else if (!msg.showIframe) {
+            iframeFocusAllowedUntil = 0;
+            iframe.removeAttribute('src');
           }
           iframe.style.display = msg.showIframe ? 'block' : 'none';
+          guardIframeFocus();
         }
       }
     });
@@ -1579,10 +1776,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
 
     function refresh() {
-      const iframe = document.getElementById('ocFrame');
-      if (iframe && iframe.src) {
-        iframe.src = iframe.src;
-      }
+      vscode.postMessage({ type: 'refresh' });
     }
 
     function startServer() {
@@ -1629,13 +1823,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'addServer', config: { url: 'http://localhost:4096', label: '' } });
     }
 
-    function claimFocus() {
-      document.body.setAttribute('tabindex', '-1');
-      document.body.focus();
-    }
-
     function sendWorkspace() {
       const iframe = document.getElementById('ocFrame');
+      iframeFocusAllowedUntil = 0;
       const folder = ${JSON.stringify(this.getWorkspaceFolder())};
       if (iframe && iframe.contentWindow && folder) {
         const origin = iframe.src ? new URL(iframe.src).origin : '*';
@@ -1644,8 +1834,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           { type: 'openProject', path: folder, dir: b64, source: 'vscode' }, origin
         );
       }
-      claimFocus();
-      [50, 150, 400, 1000].forEach(d => setTimeout(claimFocus, d));
+      [0, 50, 150, 400, 1000].forEach(delay => setTimeout(guardIframeFocus, delay));
     }
 
     function syncTheme() {
