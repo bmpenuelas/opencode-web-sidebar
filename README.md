@@ -9,7 +9,8 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 ## Features
 
 - 🖥️ **Sidebar webview** — loads the OpenCode web UI in the secondary sidebar panel
-- 🛠️ **Multi-server support** — both local (can start the local server for you) and remote servers can be added and swtich between them
+- 🛠️ **Multi-server support** — both local (can start the local server for you) and remote servers can be added and you can swtich between them
+- 💉 **Fixes for narrow display (sidebar)** — auto-hides the sessions list when clicking one
 - 🔔 **Status bar indicator** — shows connection state at a glance
 - 🚀 **Start/Stop server** — click a button to run `opencode web` if the server is not running; stop it when done
 - 🔃 **Auto-reconnect** — automatically retries when the server is unreachable (with Cancel button)
