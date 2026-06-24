@@ -52,7 +52,7 @@
     "commands": [
       {
         "command": "opencode-web-sidebar.openPanel",
-        "title": "Toggle Panel",
+        "title": "Toggle OpenCode Panel",
         "category": "OpenCode",
         "icon": {
           "light": "media/icon.svg",

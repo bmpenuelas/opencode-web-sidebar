@@ -87,6 +87,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _usingEnvPassword = false;
   private _consecutiveHealthFailures = 0;
   private _consecutiveAuthRequired = 0;
+  private _savedIframePath = '';
+  private _initialUrlSent = false;
+  private _iframeWasConnected = false;
 
   private readonly _passwordsCache = new Map<string, string>();
 
@@ -301,6 +304,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
     }
 
+    this._savedIframePath = '';
+    this._iframeWasConnected = false;
     await this.commitPendingChanges(serverId);
     this._activeServerId = serverId;
     await this._globalState.update('opencode-web-sidebar.activeServerId', serverId);
@@ -482,6 +487,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             await this.commitPendingChanges(msg.serverId);
             const gen = ++this._serverGeneration;
             this._showServerSelector = false;
+            this._iframeWasConnected = false;
             if (this._allServersPollTimer) {
               clearInterval(this._allServersPollTimer);
               this._allServersPollTimer = undefined;
@@ -548,6 +554,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             await this.commitPendingChanges(msg.serverId);
           }
           break;
+        case 'ocFrameUrlChanged':
+          if (msg.path) {
+            this._savedIframePath = msg.path;
+          }
+          break;
       }
     });
 
@@ -575,6 +586,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     });
 
     await this.loadServers();
+    this._savedIframePath = '';
+    this._initialUrlSent = false;
     this._connectionState = 'checking';
     this._isReconnecting = false;
     this.updateStatusBar();
@@ -789,12 +802,23 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const proxyUrl = this._proxyBaseUrl || (this._proxyPort
       ? `http://127.0.0.1:${this._proxyPort}`
       : '');
-    const workspaceDir = this.getWorkspaceFolder();
-    const workspaceQuery = workspaceDir
-      ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}/session`
-      : '';
-    const iframeUrl = proxyUrl ? proxyUrl + workspaceQuery : '';
-    const showIframe = !this._isReconnecting && this._connectionState === 'connected' && !!iframeUrl && !this._showServerSelector;
+    let iframeUrl = '';
+    if (proxyUrl) {
+      if (this._savedIframePath) {
+        iframeUrl = proxyUrl + this._savedIframePath;
+      } else {
+        const workspaceDir = this.getWorkspaceFolder();
+        const workspaceQuery = workspaceDir
+          ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}/session`
+          : '';
+        iframeUrl = proxyUrl + workspaceQuery;
+      }
+    }
+    const connectedAndReady = !this._isReconnecting && this._connectionState === 'connected' && !!iframeUrl && !this._showServerSelector;
+    if (connectedAndReady) {
+      this._iframeWasConnected = true;
+    }
+    const showIframe = this._iframeWasConnected && !!iframeUrl && !this._showServerSelector;
     const overlayHidden = showIframe && !this._showServerSelector;
 
     const statusBarStop = this._startedByUs
@@ -807,7 +831,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private sendStateUpdate(): void {
     if (!this._view) return;
     const state = this.computeUIState();
-    this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${state.iframeUrl ? 'set' : 'empty'}`);
+
+    const needsUrl = state.showIframe && !this._initialUrlSent;
+    if (needsUrl) {
+      this._initialUrlSent = true;
+    }
+    const iframeUrl = needsUrl ? state.iframeUrl : '';
+
+    this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${iframeUrl ? 'set' : (state.iframeUrl ? 'suppressed' : 'empty')}`);
     this._view.webview.postMessage({
       type: 'updateState',
       statusColor: state.statusColor,
@@ -816,7 +847,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       overlayContent: state.overlayContent,
       overlayHidden: state.overlayHidden,
       showIframe: state.showIframe,
-      iframeUrl: state.iframeUrl,
+      iframeUrl,
     });
   }
 
@@ -1082,8 +1113,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this.sendStateUpdate();
   }
 
+  private getHealthUrl(): string {
+    const base = this.getConfiguredUrl();
+    if (!base) return '';
+    return base.replace(/\/+$/, '') + '/global/health';
+  }
+
   private async checkHealth(): Promise<ConnectionState> {
-    const url = this.getConfiguredUrl();
+    const url = this.getHealthUrl();
     if (!url) { return 'disconnected'; }
 
     try {
@@ -1104,8 +1141,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           });
           this.log(`Health check (with auth): ${authResp.status}`);
           if (authResp.ok) { return 'connected'; }
-        } catch {
-          this.log('Health check (with auth) failed');
+        } catch (err) {
+          this.log(`Health check (with auth) failed: ${err}`);
           return 'auth-required';
         }
       }
@@ -1116,8 +1153,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         return 'disconnected';
       }
       return 'connected';
-    } catch {
-      this.log('Health check failed (server unreachable)');
+    } catch (err) {
+      this.log(`Health check failed: ${err}`);
       return 'disconnected';
     }
   }
@@ -1710,6 +1747,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           }
           iframe.style.display = msg.showIframe ? 'block' : 'none';
         }
+      } else if (msg.type === 'ocFrameUrlChanged') {
+        vscode.postMessage({ type: 'ocFrameUrlChanged', path: msg.path });
       }
     });
 

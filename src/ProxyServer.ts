@@ -100,6 +100,37 @@ function getHttpModule(protocol: string): typeof http | typeof https {
   return protocol === 'https:' ? https : http;
 }
 
+const WEBSIDEBAR_URL_TRACKER = `<script>
+(function(){
+  if (window.__ocWebSidebarUrlTracker) return;
+  window.__ocWebSidebarUrlTracker = true;
+
+  function sendUrl() {
+    try {
+      var path = window.location.pathname + window.location.search + window.location.hash;
+      window.parent.postMessage({ type: 'ocFrameUrlChanged', path: path }, '*');
+    } catch(e) {}
+  }
+
+  sendUrl();
+
+  var origPushState = history.pushState;
+  var origReplaceState = history.replaceState;
+
+  history.pushState = function() {
+    origPushState.apply(this, arguments);
+    sendUrl();
+  };
+  history.replaceState = function() {
+    origReplaceState.apply(this, arguments);
+    sendUrl();
+  };
+
+  window.addEventListener('popstate', sendUrl);
+  window.addEventListener('hashchange', sendUrl);
+})();
+</script>`;
+
 const WEBSIDEBAR_FOCUS_GUARD_SCRIPT = `<script>
 (function(){
   function installSiteTweaks(){
@@ -210,18 +241,20 @@ function injectWebSidebarScript(html: string): string {
     return html;
   }
 
+  const injectedScripts = WEBSIDEBAR_URL_TRACKER + WEBSIDEBAR_FOCUS_GUARD_SCRIPT;
+
   const headMatch = /<head\b[^>]*>/i.exec(html);
   if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;
-    return html.slice(0, insertAt) + WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html.slice(insertAt);
+    return html.slice(0, insertAt) + injectedScripts + html.slice(insertAt);
   }
 
   const scriptMatch = /<script\b/i.exec(html);
   if (scriptMatch?.index !== undefined) {
-    return html.slice(0, scriptMatch.index) + WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html.slice(scriptMatch.index);
+    return html.slice(0, scriptMatch.index) + injectedScripts + html.slice(scriptMatch.index);
   }
 
-  return WEBSIDEBAR_FOCUS_GUARD_SCRIPT + html;
+  return injectedScripts + html;
 }
 
 function sendInjectedHtml(
