@@ -2,7 +2,7 @@
   "name": "opencode-web-sidebar",
   "displayName": "OpenCode Sidebar GUI",
   "description": "OpenCode web-UI in the sidebar panel - connects to your web server or starts a new one, adds narrow UI adaptations, multi-server management...",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "license": "MIT",
   "publisher": "bmpenuelas",
   "homepage": "https://github.com/bmpenuelas/opencode-web-sidebar",
