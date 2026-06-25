@@ -19,6 +19,42 @@ const PORT_MIN = 4097;
 const PORT_MAX = 5002;
 const PROXY_FEATURE_KEY = 'web-sidebar-injection-v2';
 
+const LOCK_DIR = path.join(STATE_DIR, 'proxy-state.lock');
+const LOCK_STALE_MS = 5000;
+const LOCK_RETRIES = 50;
+
+function acquireLockSync(): void {
+  for (let i = 0; i < LOCK_RETRIES; i++) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.mkdirSync(LOCK_DIR);
+      return;
+    } catch (err: any) {
+      if (err.code !== 'EEXIST') throw err;
+      try {
+        const stat = fs.statSync(LOCK_DIR);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          fs.rmdirSync(LOCK_DIR);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      const start = Date.now();
+      while (Date.now() - start < 50) { /* spin */ }
+    }
+  }
+  throw new Error('Could not acquire proxy state lock');
+}
+
+function releaseLockSync(): void {
+  try {
+    fs.rmdirSync(LOCK_DIR);
+  } catch {
+    // Best effort
+  }
+}
+
 interface ProxyEntry {
   port: number;
   ownerPid: number;
@@ -461,43 +497,61 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
   const handler = createRequestHandler(targetUrl, auth);
   const upgradeHandler = createUpgradeHandler(targetUrl, auth);
 
-  const state = readState();
-  cleanStalePids(state);
-
-  const existing = state.proxies[key];
+  const existing = (() => {
+    const s = readState();
+    cleanStalePids(s);
+    return s.proxies[key] ?? null;
+  })();
 
   if (existing) {
     const alive = await testProxyAlive(existing.port);
     if (alive) {
-      if (!existing.clientPids.includes(process.pid)) {
-        existing.clientPids.push(process.pid);
-      }
-      writeState(state);
-
-      const dispose = async () => {
+      acquireLockSync();
+      try {
         const s = readState();
-        const e = s.proxies[key];
-        if (!e) return;
-        e.clientPids = e.clientPids.filter(p => p !== process.pid);
-        const live = e.clientPids.filter(isPidAlive);
-        if (live.length === 0) {
-          delete s.proxies[key];
-        } else if (e.ownerPid === process.pid) {
-          e.ownerPid = live[0];
+        const entry = s.proxies[key];
+        if (entry && !entry.clientPids.includes(process.pid)) {
+          entry.clientPids.push(process.pid);
         }
         writeState(s);
+      } finally {
+        releaseLockSync();
+      }
+
+      const dispose = async () => {
+        acquireLockSync();
+        try {
+          const s = readState();
+          const e = s.proxies[key];
+          if (!e) return;
+          e.clientPids = e.clientPids.filter(p => p !== process.pid);
+          const live = e.clientPids.filter(isPidAlive);
+          if (live.length === 0) {
+            delete s.proxies[key];
+          } else if (e.ownerPid === process.pid) {
+            e.ownerPid = live[0];
+          }
+          writeState(s);
+        } finally {
+          releaseLockSync();
+        }
       };
 
-      registerExitCleanup(dispose);
       return { port: existing.port, dispose };
     }
 
-    delete state.proxies[key];
-    writeState(state);
+    acquireLockSync();
+    try {
+      const s = readState();
+      delete s.proxies[key];
+      writeState(s);
+    } finally {
+      releaseLockSync();
+    }
   }
 
   const usedPorts = new Set(
-    Object.values(state.proxies).map(e => e.port)
+    Object.values(readState().proxies).map(e => e.port)
   );
 
   let server: http.Server | null = null;
@@ -506,25 +560,39 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
     if (usedPorts.has(port)) continue;
     server = await tryBind(port, handler, upgradeHandler);
     if (server) {
-      state.proxies[key] = { port, ownerPid: process.pid, clientPids: [process.pid] };
-      writeState(state);
+      acquireLockSync();
+      try {
+        const s = readState();
+        s.proxies[key] = { port, ownerPid: process.pid, clientPids: [process.pid] };
+        writeState(s);
+      } finally {
+        releaseLockSync();
+      }
 
       const dispose = async () => {
-        const s = readState();
-        const e = s.proxies[key];
-        if (!e) return;
-        e.clientPids = e.clientPids.filter(p => p !== process.pid);
-        const live = e.clientPids.filter(isPidAlive);
-        if (live.length === 0) {
-          delete s.proxies[key];
-          server?.close();
-        } else if (e.ownerPid === process.pid) {
-          e.ownerPid = live[0];
+        let shouldClose = false;
+        acquireLockSync();
+        try {
+          const s = readState();
+          const e = s.proxies[key];
+          if (!e) return;
+          e.clientPids = e.clientPids.filter(p => p !== process.pid);
+          const live = e.clientPids.filter(isPidAlive);
+          if (live.length === 0) {
+            delete s.proxies[key];
+            shouldClose = true;
+          } else if (e.ownerPid === process.pid) {
+            e.ownerPid = live[0];
+          }
+          writeState(s);
+        } finally {
+          releaseLockSync();
         }
-        writeState(s);
+        if (shouldClose) {
+          await new Promise<void>(resolve => server?.close(() => resolve()));
+        }
       };
 
-      registerExitCleanup(dispose);
       return { port, dispose };
     }
   }
@@ -538,44 +606,65 @@ export async function getOrCreateProxy(targetUrl: string): Promise<SharedProxyHa
     throw new Error('Failed to get proxy port');
   }
 
-  state.proxies[key] = { port: addr.port, ownerPid: process.pid, clientPids: [process.pid] };
-  writeState(state);
+  acquireLockSync();
+  try {
+    const s = readState();
+    s.proxies[key] = { port: addr.port, ownerPid: process.pid, clientPids: [process.pid] };
+    writeState(s);
+  } finally {
+    releaseLockSync();
+  }
 
   const dispose = async () => {
-    const s = readState();
-    const e = s.proxies[key];
-    if (!e) return;
-    e.clientPids = e.clientPids.filter(p => p !== process.pid);
-    const live = e.clientPids.filter(isPidAlive);
-    if (live.length === 0) {
-      delete s.proxies[key];
-      server?.close();
-    } else if (e.ownerPid === process.pid) {
-      e.ownerPid = live[0];
+    let shouldClose = false;
+    acquireLockSync();
+    try {
+      const s = readState();
+      const e = s.proxies[key];
+      if (!e) return;
+      e.clientPids = e.clientPids.filter(p => p !== process.pid);
+      const live = e.clientPids.filter(isPidAlive);
+      if (live.length === 0) {
+        delete s.proxies[key];
+        shouldClose = true;
+      } else if (e.ownerPid === process.pid) {
+        e.ownerPid = live[0];
+      }
+      writeState(s);
+    } finally {
+      releaseLockSync();
     }
-    writeState(s);
+    if (shouldClose) {
+      await new Promise<void>(resolve => server?.close(() => resolve()));
+    }
   };
 
-  registerExitCleanup(dispose);
   return { port: addr.port, dispose };
 }
 
-function registerExitCleanup(dispose: () => Promise<void>): void {
-  const cleanup = () => {
-    dispose().catch(() => {});
-  };
-
+function registerExitCleanup(): void {
   process.on('exit', () => {
-    const s = readState();
-    for (const [key, entry] of Object.entries(s.proxies)) {
-      entry.clientPids = entry.clientPids.filter(p => p !== process.pid);
-      const live = entry.clientPids.filter(isPidAlive);
-      if (live.length === 0) {
-        delete s.proxies[key];
-      } else if (entry.ownerPid === process.pid) {
-        entry.ownerPid = live[0];
+    try {
+      acquireLockSync();
+      try {
+        const s = readState();
+        for (const [key, entry] of Object.entries(s.proxies)) {
+          entry.clientPids = entry.clientPids.filter(p => p !== process.pid);
+          const live = entry.clientPids.filter(isPidAlive);
+          if (live.length === 0) {
+            delete s.proxies[key];
+          } else if (entry.ownerPid === process.pid) {
+            entry.ownerPid = live[0];
+          }
+        }
+        writeState(s);
+      } finally {
+        releaseLockSync();
       }
+    } catch {
+      // Best effort on exit — stale entries cleaned on next launch
     }
-    writeState(s);
   });
 }
+
+registerExitCleanup();

@@ -1305,7 +1305,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       return;
     }
 
-    const delay = Math.min(Math.pow(2, this._reconnectAttempts) * 1000, 30000);
+    const jitter = Math.random() * 1000;
+    const delay = Math.min(Math.pow(2, this._reconnectAttempts) * 1000, 30000) + jitter;
     this._reconnectAttempts++;
     const gen = this._serverGeneration;
 
@@ -1472,6 +1473,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     const iframeSrc = showIframe && iframeUrl
       ? `src="${escapeAttr(iframeUrl)}"` : '';
+    const iframeStyle = showIframe ? 'display:block' : 'display:none';
 
     this.log(`iframe URL: ${iframeUrl} (showIframe=${showIframe})`);
 
@@ -1721,7 +1723,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   </div>
 
   <iframe id="ocFrame" onload="sendWorkspace()" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-    ${iframeSrc}></iframe>
+    ${iframeSrc} style="${iframeStyle}"></iframe>
 
   <div id="overlay" class="overlay ${overlayHidden ? 'hidden' : ''}">
     ${overlayContent}
