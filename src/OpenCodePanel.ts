@@ -74,6 +74,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _pendingChanges = new Map<string, Record<string, any>>();
   private _serverStatuses = new Map<string, ConnectionState | 'unknown'>();
   private _allServersPollTimer: ReturnType<typeof setInterval> | undefined;
+  private _isFormEditing = false;
   private _pollInFlight: Promise<void> | undefined;
   private _proxyOperationId = 0;
   private _proxyPort: number | undefined;
@@ -88,7 +89,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _consecutiveHealthFailures = 0;
   private _consecutiveAuthRequired = 0;
   private _savedIframePath = '';
-  private _initialUrlSent = false;
   private _iframeWasConnected = false;
 
   private readonly _passwordsCache = new Map<string, string>();
@@ -541,12 +541,17 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         case 'addServer':
           await this.addServer(msg.config);
           break;
+        case 'formEditing':
+          this._isFormEditing = msg.editing;
+          break;
         case 'pendingChange':
           if (msg.serverId) {
             const existing = this._pendingChanges.get(msg.serverId) || {};
             existing[msg.key] = msg.value;
             this._pendingChanges.set(msg.serverId, existing);
-            this.sendStateUpdate();
+            if (!this._isFormEditing) {
+              this.sendStateUpdate();
+            }
           }
           break;
         case 'commitServerChanges':
@@ -587,7 +592,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     await this.loadServers();
     this._savedIframePath = '';
-    this._initialUrlSent = false;
     this._connectionState = 'checking';
     this._isReconnecting = false;
     this.updateStatusBar();
@@ -613,8 +617,12 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   render(): void {
     if (!this._view) { return; }
-    this._view.webview.html = this.getHtmlContent();
-    this.log('Rendered webview HTML');
+    try {
+      this._view.webview.html = this.getHtmlContent();
+      this.log('Rendered webview HTML');
+    } catch (err) {
+      this.log(`Render failed: ${err}`);
+    }
   }
 
   private async recheckConnection(options: { showChecking?: boolean; reloadIframe?: boolean } = {}): Promise<void> {
@@ -630,15 +638,20 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     if (showChecking) {
       this._connectionState = 'checking';
       this.updateStatusBar();
-      this.sendStateUpdate();
+      this.safeSendStateUpdate();
     }
 
     let state: ConnectionState = 'disconnected';
     try {
       state = await withTimeout((async () => {
-        const proxyReady = await this.startProxy();
-        if (!proxyReady) {
-          return 'disconnected';
+        // A refresh only needs to re-check the upstream and reload the iframe.
+        // Restarting a healthy proxy here can block while Node waits for the
+        // iframe's long-lived HTTP/WebSocket connections to close.
+        if (!this._proxyPort && !this._proxyBaseUrl) {
+          const proxyReady = await this.startProxy();
+          if (!proxyReady) {
+            return 'disconnected';
+          }
         }
         return await this.checkHealth();
       })(), CONNECTION_RECHECK_TIMEOUT_MS, 'connection recheck');
@@ -655,10 +668,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     this._isReconnecting = false;
     this.updateStatusBar();
 
-    if (reloadIframe && state === 'connected') {
-      this.render();
-    } else {
-      this.sendStateUpdate();
+    try {
+      this.safeSendStateUpdate({ reloadIframe: reloadIframe && state === 'connected' });
+    } catch (err) {
+      this.log(`Failed to update webview after recheck: ${err}`);
     }
 
     if (state === 'disconnected') {
@@ -828,27 +841,32 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     return { statusColor, statusText, statusBarStop, overlayContent, overlayHidden, showIframe, iframeUrl };
   }
 
-  private sendStateUpdate(): void {
+  private safeSendStateUpdate(options: { reloadIframe?: boolean } = {}): void {
     if (!this._view) return;
-    const state = this.computeUIState();
+    try {
+      const state = this.computeUIState();
 
-    const needsUrl = state.showIframe && !this._initialUrlSent;
-    if (needsUrl) {
-      this._initialUrlSent = true;
+      const iframeUrl = state.showIframe ? state.iframeUrl : '';
+
+      this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${iframeUrl ? 'set' : 'empty'}`);
+      this._view.webview.postMessage({
+        type: 'updateState',
+        statusColor: state.statusColor,
+        statusText: state.statusText,
+        statusBarStop: state.statusBarStop,
+        overlayContent: state.overlayContent,
+        overlayHidden: state.overlayHidden,
+        showIframe: state.showIframe,
+        iframeUrl,
+        reloadIframe: !!options.reloadIframe,
+      });
+    } catch (err) {
+      this.log(`Failed to send state update: ${err}`);
     }
-    const iframeUrl = needsUrl ? state.iframeUrl : '';
+  }
 
-    this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${iframeUrl ? 'set' : (state.iframeUrl ? 'suppressed' : 'empty')}`);
-    this._view.webview.postMessage({
-      type: 'updateState',
-      statusColor: state.statusColor,
-      statusText: state.statusText,
-      statusBarStop: state.statusBarStop,
-      overlayContent: state.overlayContent,
-      overlayHidden: state.overlayHidden,
-      showIframe: state.showIframe,
-      iframeUrl,
-    });
+  private sendStateUpdate(): void {
+    this.safeSendStateUpdate();
   }
 
   private async startProxy(): Promise<boolean> {
@@ -1093,7 +1111,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
       if (this._disposed || gen !== this._serverGeneration) { return; }
     }
-    this.sendStateUpdate();
+    if (!this._isFormEditing) {
+      this.sendStateUpdate();
+    }
   }
 
   private async commitPendingChanges(serverId: string): Promise<void> {
@@ -1732,6 +1752,32 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   <script>
     const vscode = acquireVsCodeApi();
 
+    let __overlayEditing = false;
+
+    const __overlay = document.getElementById('overlay');
+    __overlay.addEventListener('focusin', e => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+        if (!__overlayEditing) {
+          __overlayEditing = true;
+          vscode.postMessage({ type: 'formEditing', editing: true });
+        }
+      }
+    });
+    __overlay.addEventListener('focusout', e => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+        setTimeout(() => {
+          const active = document.activeElement;
+          if (!active || !__overlay.contains(active) ||
+              !(active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT')) {
+            if (__overlayEditing) {
+              __overlayEditing = false;
+              vscode.postMessage({ type: 'formEditing', editing: false });
+            }
+          }
+        }, 0);
+      }
+    });
+
     window.addEventListener('message', event => {
       const msg = event.data;
       if (msg.type === 'updateState') {
@@ -1742,7 +1788,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         document.getElementById('overlay').className = 'overlay' + (msg.overlayHidden ? ' hidden' : '');
         const iframe = document.getElementById('ocFrame');
         if (iframe) {
-          if (msg.showIframe && msg.iframeUrl && iframe.src !== msg.iframeUrl) {
+          if (msg.showIframe && msg.iframeUrl && (msg.reloadIframe || iframe.src !== msg.iframeUrl)) {
             iframe.src = msg.iframeUrl;
           } else if (!msg.showIframe) {
             iframe.removeAttribute('src');
