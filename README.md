@@ -2,7 +2,11 @@
 
 Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sidebar — connects to your server or starts a new one.
 
-💫 Now automatically opens your working project folder in OpenCode Web when you open the sidebar!
+💫 Now automatically opens a new session in your working project folder when the sidebar initializes!
+
+Works with both the **new** and old OpenCode Web UI. Also available on [Android](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile) for coding away from your computer (iOS coming soon):
+
+[![install Android](media/install_google_play_color_light.png)](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile)
 
 ![screenshot](media/screenshot_0.png)
 
@@ -19,6 +23,7 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 - 🔐 **Env var fallback** — reads `OPENCODE_SERVER_PASSWORD` if no password is stored
 - 📁 **Open files** — open files in VS Code directly from the webview
 - 🌐 **Proxy** — local proxy strips frame-blocking headers for seamless iframe embedding and prevents losing the cursor focus while typing in files
+- 📍 **Workspace routing** — registers and opens the current VS Code folder through OpenCode's project URL, including folders never opened in the new web UI, and starts a fresh draft when the sidebar initializes or the workspace changes
 - 🔗 **Remote SSH** — works with [VSCode Remote SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) via automatic port forwarding
 
 ## ❗ Important: requirements

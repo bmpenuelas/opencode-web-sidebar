@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import type * as net from 'net';
+import { OPENCODE_PROJECT_BOOTSTRAP_SCRIPT } from './OpenCodeProjectBootstrap';
 
 const BLOCKED_HEADERS = new Set([
   'content-security-policy',
@@ -17,7 +18,7 @@ const STATE_FILE = path.join(STATE_DIR, 'proxy-state.json');
 
 const PORT_MIN = 4097;
 const PORT_MAX = 5002;
-const PROXY_FEATURE_KEY = 'web-sidebar-injection-v2';
+const PROXY_FEATURE_KEY = 'web-sidebar-injection-v3';
 
 const LOCK_DIR = path.join(STATE_DIR, 'proxy-state.lock');
 const LOCK_STALE_MS = 5000;
@@ -277,7 +278,9 @@ function injectWebSidebarScript(html: string): string {
     return html;
   }
 
-  const injectedScripts = WEBSIDEBAR_URL_TRACKER + WEBSIDEBAR_FOCUS_GUARD_SCRIPT;
+  const injectedScripts = OPENCODE_PROJECT_BOOTSTRAP_SCRIPT
+    + WEBSIDEBAR_URL_TRACKER
+    + WEBSIDEBAR_FOCUS_GUARD_SCRIPT;
 
   const headMatch = /<head\b[^>]*>/i.exec(html);
   if (headMatch?.index !== undefined) {

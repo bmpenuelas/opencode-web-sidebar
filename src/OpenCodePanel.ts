@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
 import { spawn, type ChildProcess } from 'child_process';
 import { getOrCreateProxy } from './ProxyServer';
+import {
+  decideTrackedIframePath,
+  getWorkspaceSessionPath,
+} from './WorkspaceNavigation';
 
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
 const PROXY_START_TIMEOUT_MS = 4000;
@@ -89,6 +93,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _consecutiveHealthFailures = 0;
   private _consecutiveAuthRequired = 0;
   private _savedIframePath = '';
+  private _workspaceLaunchPath = '';
+  private _workspaceLaunchPending = false;
+  private _workspaceFolder = '';
+  private _iframeNeedsNavigation = false;
   private _iframeWasConnected = false;
 
   private readonly _passwordsCache = new Map<string, string>();
@@ -304,12 +312,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       vscode.commands.executeCommand('setContext', 'opencode-web-sidebar.startedByUs', false);
     }
 
-    this._savedIframePath = '';
-    this._iframeWasConnected = false;
     await this.commitPendingChanges(serverId);
     this._activeServerId = serverId;
     await this._globalState.update('opencode-web-sidebar.activeServerId', serverId);
     this.loadCredentialsForActive();
+    this.prepareWorkspaceLaunch(true);
 
     this._connectionState = 'checking';
     this.updateStatusBar();
@@ -344,6 +351,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     await this.persistServers();
     if (serverId === this._activeServerId && gen === this._serverGeneration) {
       if (key === 'url' || key === 'isWsl') {
+        this.prepareWorkspaceLaunch(true);
         this._connectionState = 'checking';
         this.updateStatusBar();
         this.render();
@@ -487,7 +495,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             await this.commitPendingChanges(msg.serverId);
             const gen = ++this._serverGeneration;
             this._showServerSelector = false;
-            this._iframeWasConnected = false;
             if (this._allServersPollTimer) {
               clearInterval(this._allServersPollTimer);
               this._allServersPollTimer = undefined;
@@ -496,6 +503,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             this._activeServerId = msg.serverId;
             await this._globalState.update('opencode-web-sidebar.activeServerId', msg.serverId);
             this.loadCredentialsForActive();
+            this.prepareWorkspaceLaunch(true);
             this._connectionState = 'checking';
             this.updateStatusBar();
             this.render();
@@ -561,7 +569,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
           break;
         case 'ocFrameUrlChanged':
           if (msg.path) {
-            this._savedIframePath = msg.path;
+            this.trackIframePath(msg.path);
           }
           break;
       }
@@ -591,7 +599,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     });
 
     await this.loadServers();
-    this._savedIframePath = '';
+    this.prepareWorkspaceLaunch(true);
     this._connectionState = 'checking';
     this._isReconnecting = false;
     this.updateStatusBar();
@@ -686,7 +694,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   async onUrlChanged(): Promise<void> {
     this.log('Config changed, reloading servers');
     await this.loadServers();
+    this.prepareWorkspaceLaunch(true);
     await this.recheckConnection({ showChecking: true });
+  }
+
+  onWorkspaceFoldersChanged(): void {
+    if (!this.prepareWorkspaceLaunch(false)) {
+      return;
+    }
+    this.safeSendStateUpdate();
   }
 
   dispose(): void {
@@ -740,6 +756,40 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     }
     this.log(`Workspace folder: ${raw}`);
     return raw;
+  }
+
+  private prepareWorkspaceLaunch(force: boolean): boolean {
+    const workspaceFolder = this.getWorkspaceFolder();
+    if (!force && workspaceFolder === this._workspaceFolder) {
+      return false;
+    }
+    this._workspaceFolder = workspaceFolder;
+    this._workspaceLaunchPath = getWorkspaceSessionPath(workspaceFolder);
+    this._workspaceLaunchPending = !!this._workspaceLaunchPath;
+    this._savedIframePath = '';
+    this._iframeNeedsNavigation = true;
+    this._iframeWasConnected = false;
+    this.log(`Prepared workspace navigation: ${this._workspaceLaunchPath || '/'}`);
+    return true;
+  }
+
+  private trackIframePath(path: string): void {
+    const decision = decideTrackedIframePath(
+      path,
+      this._workspaceLaunchPending,
+      this._workspaceLaunchPath,
+    );
+    if (!decision.accept) {
+      this.log(`Ignored iframe path during workspace navigation: ${path}`);
+      this._iframeNeedsNavigation = true;
+      this.safeSendStateUpdate();
+      return;
+    }
+    this._savedIframePath = path;
+    if (decision.completesWorkspaceLaunch) {
+      this._workspaceLaunchPending = false;
+      this.log(`Workspace navigation completed: ${path}`);
+    }
   }
 
   private computeUIState(): {
@@ -815,18 +865,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     const proxyUrl = this._proxyBaseUrl || (this._proxyPort
       ? `http://127.0.0.1:${this._proxyPort}`
       : '');
-    let iframeUrl = '';
-    if (proxyUrl) {
-      if (this._savedIframePath) {
-        iframeUrl = proxyUrl + this._savedIframePath;
-      } else {
-        const workspaceDir = this.getWorkspaceFolder();
-        const workspaceQuery = workspaceDir
-          ? `/${Buffer.from(workspaceDir).toString('base64').replace(/=+$/, '')}/session`
-          : '';
-        iframeUrl = proxyUrl + workspaceQuery;
-      }
-    }
+    const iframePath = this._workspaceLaunchPending
+      ? this._workspaceLaunchPath
+      : this._savedIframePath || this._workspaceLaunchPath;
+    const iframeUrl = proxyUrl ? proxyUrl + iframePath : '';
     const connectedAndReady = !this._isReconnecting && this._connectionState === 'connected' && !!iframeUrl && !this._showServerSelector;
     if (connectedAndReady) {
       this._iframeWasConnected = true;
@@ -846,9 +888,15 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     try {
       const state = this.computeUIState();
 
-      const iframeUrl = state.showIframe ? state.iframeUrl : '';
+      const navigateIframe = state.showIframe
+        && !!state.iframeUrl
+        && (this._iframeNeedsNavigation || !!options.reloadIframe);
+      const iframeUrl = navigateIframe ? state.iframeUrl : '';
+      if (navigateIframe) {
+        this._iframeNeedsNavigation = false;
+      }
 
-      this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${iframeUrl ? 'set' : 'empty'}`);
+      this.log(`sendStateUpdate: state=${this._connectionState} showIframe=${state.showIframe} overlayHidden=${state.overlayHidden} iframeUrl=${iframeUrl ? 'set' : 'preserved'}`);
       this._view.webview.postMessage({
         type: 'updateState',
         statusColor: state.statusColor,
@@ -892,6 +940,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
       this._proxyPort = handle.port;
       this._proxyDispose = handle.dispose;
+      this._iframeNeedsNavigation = true;
       this.log(`Proxy listening on port ${this._proxyPort}`);
       this._proxyBaseUrl = await withTimeout(this.resolveProxyBaseUrl(), PROXY_START_TIMEOUT_MS, 'proxy URI resolution');
       return true;
@@ -1790,8 +1839,6 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         if (iframe) {
           if (msg.showIframe && msg.iframeUrl && (msg.reloadIframe || iframe.src !== msg.iframeUrl)) {
             iframe.src = msg.iframeUrl;
-          } else if (!msg.showIframe) {
-            iframe.removeAttribute('src');
           }
           iframe.style.display = msg.showIframe ? 'block' : 'none';
         }
@@ -1865,7 +1912,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       const folder = ${JSON.stringify(this.getWorkspaceFolder())};
       if (iframe && iframe.contentWindow && folder) {
         const origin = iframe.src ? new URL(iframe.src).origin : '*';
-        const b64 = btoa(folder).replace(/=+$/, '');
+        const bytes = new TextEncoder().encode(folder);
+        const binary = Array.from(bytes, byte => String.fromCharCode(byte)).join('');
+        const b64 = btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
         iframe.contentWindow.postMessage(
           { type: 'openProject', path: folder, dir: b64, source: 'vscode' }, origin
         );

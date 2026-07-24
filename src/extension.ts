@@ -115,8 +115,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   vscode.workspace.onDidChangeWorkspaceFolders(() => {
     const hasFolderNow = !!(vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0);
-    if (hasFolderNow && context.globalState.get<boolean>('opencode-web-sidebar.panelOpen', true)) {
-      panel?.show();
+    if (hasFolderNow) {
+      panel?.onWorkspaceFoldersChanged();
+      if (context.globalState.get<boolean>('opencode-web-sidebar.panelOpen', true)) {
+        panel?.show();
+      }
     } else if (!hasFolderNow && panel?.isVisible) {
       panel?.close();
     }

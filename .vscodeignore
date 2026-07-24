@@ -7,5 +7,6 @@ src/**
 **/eslint.config.mjs
 **/*.map
 **/*.ts
+out/**/*.test.js
 **/.vscode-test.*
 node_modules/**
