@@ -448,7 +448,11 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
     };
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
-      this.log(`Message from webview: ${JSON.stringify(msg)}`);
+      // Clipboard content never reaches the log.
+      const loggable = msg?.type === 'ocClipboardWrite'
+        ? { ...msg, text: `<${String(msg.text ?? '').length} chars>` }
+        : msg;
+      this.log(`Message from webview: ${JSON.stringify(loggable)}`);
       switch (msg.type) {
         case 'closePanel':
           vscode.commands.executeCommand('opencode-web-sidebar.openPanel');
@@ -572,6 +576,22 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
             this.trackIframePath(msg.path);
           }
           break;
+        case 'ocClipboardRead': {
+          const text = await vscode.env.clipboard.readText();
+          this._view?.webview.postMessage({ type: 'ocClipboardResult', id: msg.id, text, ok: true });
+          break;
+        }
+        case 'ocClipboardWrite': {
+          let ok = true;
+          try {
+            await vscode.env.clipboard.writeText(typeof msg.text === 'string' ? msg.text : '');
+          } catch (err) {
+            ok = false;
+            this.log(`Clipboard write failed: ${err}`);
+          }
+          this._view?.webview.postMessage({ type: 'ocClipboardResult', id: msg.id, ok });
+          break;
+        }
       }
     });
 
@@ -1844,6 +1864,20 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         }
       } else if (msg.type === 'ocFrameUrlChanged') {
         vscode.postMessage({ type: 'ocFrameUrlChanged', path: msg.path });
+      } else if (msg.type === 'ocClipboardReadRequest' || msg.type === 'ocClipboardWriteRequest') {
+        const frame = document.getElementById('ocFrame');
+        // Only the OpenCode iframe may reach the clipboard.
+        if (!frame || event.source !== frame.contentWindow) { return; }
+        vscode.postMessage(msg.type === 'ocClipboardReadRequest'
+          ? { type: 'ocClipboardRead', id: msg.id }
+          : { type: 'ocClipboardWrite', id: msg.id, text: msg.text });
+      } else if (msg.type === 'ocClipboardResult') {
+        const frame = document.getElementById('ocFrame');
+        if (!frame || !frame.contentWindow || !frame.src) { return; }
+        frame.contentWindow.postMessage(
+          { type: 'ocClipboardResponse', id: msg.id, text: msg.text, ok: msg.ok },
+          new URL(frame.src).origin
+        );
       }
     });
 
