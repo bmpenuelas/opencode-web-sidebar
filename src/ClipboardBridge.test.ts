@@ -89,11 +89,13 @@ test('falls back to execCommand when no native clipboard event fires', async () 
   bridge.press('c');
   bridge.press('x');
   bridge.press('a');
+  bridge.press('z');
   await settle();
 
   strictEqual(bridge.commands.includes('copy'), true);
   strictEqual(bridge.commands.includes('cut'), true);
   strictEqual(bridge.commands.includes('selectAll'), true);
+  strictEqual(bridge.commands.includes('undo'), true);
 });
 
 test('leaves a working native copy alone', async () => {
@@ -103,6 +105,15 @@ test('leaves a working native copy alone', async () => {
   await settle();
 
   strictEqual(bridge.commands.includes('copy'), false);
+});
+
+test('leaves a working native undo alone', async () => {
+  const bridge = runBridge();
+  bridge.press('z');
+  bridge.emit('undo');
+  await settle();
+
+  strictEqual(bridge.commands.includes('undo'), false);
 });
 
 test('pastes clipboard text supplied by the extension host', async () => {

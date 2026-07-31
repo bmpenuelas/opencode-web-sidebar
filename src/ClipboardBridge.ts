@@ -89,7 +89,8 @@ export const WEBSIDEBAR_CLIPBOARD_SCRIPT = `<script>
       readClipboardText().then(function(text){
         if(text)document.execCommand('insertText',false,text);
       }).catch(function(){});
-    })}
+    })},
+    z:function(){withNativeFallback('undo',function(){document.execCommand('undo')})}
   };
 
   document.addEventListener('keydown',function(event){
