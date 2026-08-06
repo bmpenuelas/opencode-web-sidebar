@@ -592,8 +592,14 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this.log(`Visibility changed: ${this._isVisible}`);
       if (this._isVisible) {
         this._view = webviewView;
-        void this.recheckConnection({ showChecking: false });
+        // VS Code can discard an iframe's renderer while its containing view is
+        // hidden. In that case the webview shell survives (and still shows the
+        // last connection state), but the iframe comes back blank. Always
+        // navigate it again after the view becomes visible.
+        this._iframeNeedsNavigation = true;
+        void this.recheckConnection({ showChecking: false, reloadIframe: true });
       } else {
+        this._iframeNeedsNavigation = true;
         this.stopPolling();
       }
     });
@@ -615,6 +621,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   async close(): Promise<void> {
     this._isVisible = false;
+    this._iframeNeedsNavigation = true;
     this.stopPolling();
     try {
       await vscode.commands.executeCommand('workbench.action.toggleAuxiliaryBar');
