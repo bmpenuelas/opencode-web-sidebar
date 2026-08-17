@@ -6,6 +6,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import type * as net from 'net';
 import { OPENCODE_PROJECT_BOOTSTRAP_SCRIPT } from './OpenCodeProjectBootstrap';
+import { WEBSIDEBAR_CLIPBOARD_SCRIPT } from './ClipboardBridge';
 
 const BLOCKED_HEADERS = new Set([
   'content-security-policy',
@@ -18,7 +19,7 @@ const STATE_FILE = path.join(STATE_DIR, 'proxy-state.json');
 
 const PORT_MIN = 4097;
 const PORT_MAX = 5002;
-const PROXY_FEATURE_KEY = 'web-sidebar-injection-v3';
+const PROXY_FEATURE_KEY = 'web-sidebar-injection-v4';
 
 const LOCK_DIR = path.join(STATE_DIR, 'proxy-state.lock');
 const LOCK_STALE_MS = 5000;
@@ -251,6 +252,7 @@ const WEBSIDEBAR_FOCUS_GUARD_SCRIPT = `<script>
 })();
 </script>`;
 
+
 function shouldInjectScript(req: http.IncomingMessage, proxyRes: http.IncomingMessage): boolean {
   if (req.method === 'HEAD') {
     return false;
@@ -280,7 +282,8 @@ function injectWebSidebarScript(html: string): string {
 
   const injectedScripts = OPENCODE_PROJECT_BOOTSTRAP_SCRIPT
     + WEBSIDEBAR_URL_TRACKER
-    + WEBSIDEBAR_FOCUS_GUARD_SCRIPT;
+    + WEBSIDEBAR_FOCUS_GUARD_SCRIPT
+    + WEBSIDEBAR_CLIPBOARD_SCRIPT;
 
   const headMatch = /<head\b[^>]*>/i.exec(html);
   if (headMatch?.index !== undefined) {
