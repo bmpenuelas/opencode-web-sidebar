@@ -18,7 +18,9 @@ const STATE_FILE = path.join(STATE_DIR, 'proxy-state.json');
 
 const PORT_MIN = 4097;
 const PORT_MAX = 5002;
-const PROXY_FEATURE_KEY = 'web-sidebar-injection-v3';
+// Changing proxy semantics requires a distinct shared-proxy key so an updated
+// extension never reconnects to an older VS Code process still hosting it.
+const PROXY_FEATURE_KEY = 'web-sidebar-injection-v4';
 
 const LOCK_DIR = path.join(STATE_DIR, 'proxy-state.lock');
 const LOCK_STALE_MS = 5000;
@@ -273,6 +275,12 @@ function shouldInjectScript(req: http.IncomingMessage, proxyRes: http.IncomingMe
   return /\btext\/html\b/i.test(contentTypeValue);
 }
 
+function isEventStream(proxyRes: http.IncomingMessage): boolean {
+  const contentType = proxyRes.headers['content-type'];
+  const value = Array.isArray(contentType) ? contentType.join(';') : contentType || '';
+  return /\btext\/event-stream\b/i.test(value);
+}
+
 function injectWebSidebarScript(html: string): string {
   if (html.includes('__ocWebSidebarFocusGuard')) {
     return html;
@@ -381,6 +389,14 @@ function createRequestHandler(targetUrl: string, auth: string | null): http.Requ
         sendInjectedHtml(proxyRes, res, resHeaders);
       } else {
         res.writeHead(proxyRes.statusCode || 200, resHeaders);
+        // OpenCode delivers chat updates over a long-lived SSE connection.  The
+        // request timeout above is useful while connecting to the upstream, but
+        // once this is an event stream it must not close an otherwise healthy
+        // idle connection (the server heartbeat is also every 10 seconds).
+        if (isEventStream(proxyRes)) {
+          proxyReq.setTimeout(0);
+          res.flushHeaders();
+        }
         proxyRes.pipe(res);
       }
     });
