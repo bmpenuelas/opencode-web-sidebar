@@ -4,9 +4,9 @@ Renders your [OpenCode](https://opencode.ai) web UI right inside VS Code's sideb
 
 💫 Now automatically opens a new session in your working project folder when the sidebar initializes!
 
-Works with both the **new** and old OpenCode Web UI. Also available on [Android](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile) for coding away from your computer (iOS coming soon):
+Works with both the **new** and old OpenCode Web UI. Also available on [Android](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile) and [iOS](https://apps.apple.com/app/id6787161501) for coding away from your computer:
 
-[![install Android](media/install_google_play_color_light.png)](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile)
+[![install Android](media/install_google_play_color_light.png)](https://play.google.com/store/apps/details?id=com.logicedge.opencodemobile) [![install iOS](media/install_app_store_color_light.png)](https://apps.apple.com/app/id6787161501)
 
 ![screenshot](media/screenshot_0.png)
 
