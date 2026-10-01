@@ -29,6 +29,28 @@ function escapeJsString(text: string): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
+function describeFetchError(err: unknown): string {
+  // undici wraps the real network error (ECONNREFUSED, ENOTFOUND, ...) in err.cause
+  const cause = (err as { cause?: { code?: string } })?.cause;
+  switch (cause?.code) {
+    case 'ECONNREFUSED': return 'Connection refused: no server is listening at this address.';
+    case 'ENOTFOUND': return 'Host not found: check the server URL.';
+    case 'ETIMEDOUT':
+    case 'UND_ERR_CONNECT_TIMEOUT': return 'Connection timed out.';
+  }
+  if ((err as Error)?.name === 'TimeoutError') { return 'Health check timed out.'; }
+  return String(cause ?? err);
+}
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
@@ -91,6 +113,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
   private _migrationDone = false;
   private _usingEnvPassword = false;
   private _consecutiveHealthFailures = 0;
+  private _lastHealthError = '';
+  private _lastServerError = '';
   private _consecutiveAuthRequired = 0;
   private _savedIframePath = '';
   private _workspaceLaunchPath = '';
@@ -865,11 +889,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         '<div class="lock-icon">🔒</div>' +
         '<span>Server is online but password protected</span>' +
         '<div class="btn-row"><button class="btn btn-default" onclick="setPassword()">Login with Username &amp; Password</button></div>'
-      ) : this._connectionState === 'disconnected' ? (
-        '<span>OpenCode server is not reachable</span>' +
-        '<div class="btn-row"><button class="btn btn-default" onclick="selectServer()">Servers</button>' +
-        '<button class="btn btn-outline" onclick="openSettings()">Settings</button></div>'
-      ) : '';
+      ) : this._connectionState === 'disconnected' ? this.renderDisconnectedHelp() : '';
 
       overlayContent = card
         ? `<div style="display:flex;flex-direction:column;width:100%;height:100%;align-items:center">
@@ -898,6 +918,29 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       : '';
 
     return { statusColor, statusText, statusBarStop, overlayContent, overlayHidden, showIframe, iframeUrl };
+  }
+
+  private canStartActiveServer(): boolean {
+    const active = this.getActiveServer();
+    return !!active && isLoopbackUrl(active.url) && !!this.getServerCommand();
+  }
+
+  private renderDisconnectedHelp(): string {
+    const reason = this._lastServerError || this._lastHealthError;
+    const reasonHtml = reason
+      ? `<span style="font-size:12px;opacity:.8;text-align:center;max-width:360px">${escapeAttr(reason)}</span>`
+      : '';
+    if (this.canStartActiveServer()) {
+      return '<span>OpenCode server is not running</span>' + reasonHtml +
+        `<span style="font-size:12px;opacity:.8">Start it with <code>${escapeAttr(this.getServerCommand())}</code></span>` +
+        '<div class="btn-row"><button class="btn btn-default" onclick="startServer()">Start Server</button>' +
+        '<button class="btn btn-outline" onclick="selectServer()">Servers</button>' +
+        '<button class="btn btn-outline" onclick="openSettings()">Settings</button></div>';
+    }
+    return '<span>OpenCode server is not reachable</span>' + reasonHtml +
+      '<span style="font-size:12px;opacity:.8;text-align:center;max-width:360px">Make sure the server is running and the URL is correct.</span>' +
+      '<div class="btn-row"><button class="btn btn-default" onclick="selectServer()">Servers</button>' +
+      '<button class="btn btn-outline" onclick="openSettings()">Settings</button></div>';
   }
 
   private safeSendStateUpdate(options: { reloadIframe?: boolean } = {}): void {
@@ -1037,6 +1080,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     this.log(`Starting server: ${cmdStr}`);
 
+    this._lastServerError = '';
     this._connectionState = 'starting';
     this._isReconnecting = false;
     this._startedByUs = true;
@@ -1049,10 +1093,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
     try {
       const id = ++this._serverProcessId;
-      this._serverProcess = spawn(cmd, args, {
-        cwd: workspaceFolder,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // On Windows, CLIs like opencode are usually .cmd shims, which require a shell to launch
+      this._serverProcess = process.platform === 'win32'
+        ? spawn(cmdStr, { cwd: workspaceFolder, stdio: ['ignore', 'pipe', 'pipe'], shell: true, windowsHide: true })
+        : spawn(cmd, args, { cwd: workspaceFolder, stdio: ['ignore', 'pipe', 'pipe'] });
 
       this._serverProcess.stdout?.on('data', (data: Buffer) => {
         for (const line of data.toString().split('\n')) {
@@ -1071,6 +1115,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._serverProcess.on('error', (err) => {
         if (id !== this._serverProcessId) { return; }
         this.log(`Server process error: ${err.message}`);
+        this._lastServerError = `Failed to start "${cmdStr}": ${err.message}`;
         this._serverProcess = undefined;
         this.cleanupServer();
       });
@@ -1078,6 +1123,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       this._serverProcess.on('exit', (code, signal) => {
         if (id !== this._serverProcessId) { return; }
         this.log(`Server process exited (code=${code}, signal=${signal})`);
+        if (code) {
+          this._lastServerError = `"${cmdStr}" exited with code ${code}. See the OpenCode output channel for details.`;
+        }
         this._serverProcess = undefined;
         this.cleanupServer();
       });
@@ -1099,6 +1147,13 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
 
   private _killServerProcess(): void {
     if (!this._serverProcess) { return; }
+    if (process.platform === 'win32' && this._serverProcess.pid) {
+      // Killing the shell alone would orphan the server; terminate the whole process tree
+      spawn('taskkill', ['/pid', String(this._serverProcess.pid), '/T', '/F'], { windowsHide: true })
+        .on('error', (err) => this.log(`taskkill failed: ${err.message}`));
+      this._serverProcess = undefined;
+      return;
+    }
     this._serverProcess.kill('SIGTERM');
     const proc = this._serverProcess;
     setTimeout(() => {
@@ -1214,6 +1269,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
         method: 'HEAD',
       });
+      this._lastHealthError = '';
+      this._lastServerError = '';
       this.log(`Health check (no auth): ${resp.status}`);
       if (resp.ok) { return 'connected'; }
 
@@ -1240,7 +1297,9 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
       return 'connected';
     } catch (err) {
-      this.log(`Health check failed: ${err}`);
+      const cause = (err as { cause?: unknown })?.cause;
+      this._lastHealthError = describeFetchError(err);
+      this.log(`Health check failed (${url}): ${err}${cause ? ` — cause: ${cause}` : ''}`);
       return 'disconnected';
     }
   }
@@ -1451,10 +1510,18 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       else statusClass += ' disconnected';
     }
 
+    const activeDown = isActive && this._connectionState === 'disconnected';
+    const activeStart = activeDown && this.canStartActiveServer()
+      ? ` <button class="btn btn-default btn-xs" onclick="startServer()">Start Server</button>`
+      : '';
+    const activeReason = activeDown && (this._lastServerError || this._lastHealthError)
+      ? `<div style="font-size:11px;opacity:.75;padding:0 12px">${escapeAttr(this._lastServerError || this._lastHealthError)}</div>`
+      : '';
+
     let action: string;
     if (isLocal) {
       if (isActive) {
-        action = `<span class="badge badge-active">ACTIVE</span>`;
+        action = `<span class="badge badge-active">ACTIVE</span>${activeStart}`;
       } else {
         action = `<div class="btn-row">
           <button class="btn btn-outline btn-xs" onclick="startAndConnect('${serverIdJs}')">Start &amp; Connect</button>
@@ -1463,7 +1530,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
       }
     } else {
       if (isActive) {
-        action = `<span class="badge badge-active">ACTIVE</span>`;
+        action = `<span class="badge badge-active">ACTIVE</span>${activeStart}`;
       } else {
         action = `<button class="btn btn-default btn-xs" onclick="connectToServer('${serverIdJs}')">Connect</button>`;
       }
@@ -1495,6 +1562,7 @@ export class OpenCodePanel implements vscode.WebviewViewProvider {
         <div class="card-description">${urlValue}</div>
         <div class="card-action">${isActive ? action : `<span class="${statusClass}"></span> ${action}`}</div>
       </div>
+      ${activeReason}
       <div class="card-content">
         <input class="input" type="text" value="${urlValue}" onchange="pendingChange('${serverIdJs}','url',this.value)" placeholder="http://localhost:4096">
         <div class="field-row"${authFieldsStyle}>
